@@ -1,0 +1,48 @@
+# Dockerfile for SAM3/EfficientSAM3 PyTorch backend testing
+# Base: NVIDIA NGC PyTorch + ROS2 Jazzy
+#
+# Build:
+#   docker build -f docker/Dockerfile.pytorch -t sam3_pytorch:latest .
+#
+# Run:
+#   docker run --rm --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all \
+#     -v /media/sewon/Dev/isaac_ros_image_segmentation:/ws \
+#     -v /tmp:/tmp \
+#     sam3_pytorch:latest bash
+#
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:24.12-py3
+FROM ${BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV ROS_DISTRO=jazzy
+
+# ---- ROS2 Jazzy via apt (Ubuntu 24.04) ----
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        software-properties-common curl gnupg2 lsb-release && \
+    curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
+        -o /usr/share/keyrings/ros-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] \
+        http://packages.ros.org/ros2/ubuntu $(lsb_release -cs) main" \
+        > /etc/apt/sources.list.d/ros2.list && \
+    apt-get update && apt-get install -y --no-install-recommends \
+        ros-${ROS_DISTRO}-ros-base \
+        ros-${ROS_DISTRO}-cv-bridge \
+        ros-${ROS_DISTRO}-vision-msgs \
+        python3-colcon-common-extensions && \
+    rm -rf /var/lib/apt/lists/*
+
+# ---- Python dependencies ----
+# numpy<2 required for cv_bridge compatibility
+RUN pip install --no-cache-dir \
+        "numpy<2" \
+        tokenizers \
+        opencv-python-headless \
+        einops \
+        timm \
+        open_clip_torch
+
+# ---- Source ROS2 by default ----
+RUN echo "source /opt/ros/${ROS_DISTRO}/setup.bash" >> /etc/bash.bashrc
+
+WORKDIR /ws
+CMD ["bash"]
