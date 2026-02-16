@@ -1,0 +1,38 @@
+name: "sam3_text_encoder"
+platform: "onnxruntime_onnx"
+max_batch_size: 0
+input [
+  {
+    name: "input_ids"
+    data_type: TYPE_INT64
+    dims: [ -1, 32 ]
+  },
+  {
+    name: "attention_mask"
+    data_type: TYPE_INT64
+    dims: [ -1, 32 ]
+  }
+]
+output [
+  {
+    name: "text_features"
+    data_type: TYPE_FP32
+    dims: [ -1, 32, 256 ]
+  },
+  {
+    name: "text_mask"
+    data_type: TYPE_BOOL
+    dims: [ -1, 32 ]
+  }
+]
+instance_group [
+  {
+    count: 1
+    kind: KIND_GPU
+  }
+]
+version_policy: {
+  specific {
+    versions: [ 1 ]
+  }
+}

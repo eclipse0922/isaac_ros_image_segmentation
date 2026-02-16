@@ -1,0 +1,68 @@
+name: "sam3_decoder"
+platform: "onnxruntime_onnx"
+max_batch_size: 0
+input [
+  {
+    name: "fpn_feat_0"
+    data_type: TYPE_FP32
+    dims: [ -1, 256, 288, 288 ]
+  },
+  {
+    name: "fpn_feat_1"
+    data_type: TYPE_FP32
+    dims: [ -1, 256, 144, 144 ]
+  },
+  {
+    name: "fpn_feat_2"
+    data_type: TYPE_FP32
+    dims: [ -1, 256, 72, 72 ]
+  },
+  {
+    name: "fpn_pos_2"
+    data_type: TYPE_FP32
+    dims: [ -1, 256, 72, 72 ]
+  },
+  {
+    name: "prompt_features"
+    data_type: TYPE_FP32
+    dims: [ -1, -1, 256 ]
+  },
+  {
+    name: "prompt_mask"
+    data_type: TYPE_BOOL
+    dims: [ -1, -1 ]
+  }
+]
+output [
+  {
+    name: "pred_masks"
+    data_type: TYPE_FP32
+    dims: [ -1, 200, 288, 288 ]
+  },
+  {
+    name: "pred_boxes"
+    data_type: TYPE_FP32
+    dims: [ -1, 200, 4 ]
+  },
+  {
+    name: "pred_logits"
+    data_type: TYPE_FP32
+    dims: [ -1, 200 ]
+  },
+  {
+    name: "presence_logits"
+    data_type: TYPE_FP32
+    dims: [ -1, 1 ]
+  }
+]
+instance_group [
+  {
+    count: 1
+    kind: KIND_GPU
+  }
+]
+version_policy: {
+  specific {
+    versions: [ 1 ]
+  }
+}
