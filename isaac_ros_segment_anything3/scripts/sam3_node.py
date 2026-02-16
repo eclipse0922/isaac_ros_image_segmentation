@@ -44,6 +44,7 @@ Topics:
 
 import os
 import threading
+import time as _time
 
 import cv2
 import numpy as np
@@ -737,6 +738,8 @@ class Sam3Node(Node):
             text_cache = self._text_features_cache
             confidence_threshold = self._confidence_threshold
 
+        _t_start = _time.perf_counter()
+
         self.get_logger().info(
             f'Processing {msg.width}x{msg.height} image with '
             f'prompts={current_prompts}')
@@ -747,11 +750,13 @@ class Sam3Node(Node):
         except Exception as e:
             self.get_logger().error(f'Image conversion failed: {e}')
             return
+        _t_cvbridge = _time.perf_counter()
 
         orig_h, orig_w = cv_image.shape[:2]
 
         # 1. Preprocess image
         preprocessed = self._preprocess_image(cv_image)
+        _t_preproc = _time.perf_counter()
 
         # 2. Vision encoder (always run for each new frame)
         if self._backend == 'pytorch':
@@ -760,6 +765,7 @@ class Sam3Node(Node):
             vision_result = self._run_vision_encoder(preprocessed)
         if vision_result is None:
             return
+        _t_vision = _time.perf_counter()
 
         # 3. Text encoder (cached until prompt changes)
         if text_cache is not None:
@@ -813,6 +819,8 @@ class Sam3Node(Node):
             all_logits.append(logits[0])     # (200,)
             all_presence.append(presence[0])  # (1,)
 
+        _t_decoder = _time.perf_counter()
+
         if not all_masks:
             return
 
@@ -826,6 +834,15 @@ class Sam3Node(Node):
             msg.header, orig_h, orig_w,
             pred_masks, pred_boxes, pred_logits, presence_logits,
             current_prompts, confidence_threshold)
+        _t_end = _time.perf_counter()
+
+        self.get_logger().info(
+            f'Timing: cvbridge={(_t_cvbridge-_t_start)*1000:.1f}ms '
+            f'preproc={(_t_preproc-_t_cvbridge)*1000:.1f}ms '
+            f'vision={(_t_vision-_t_preproc)*1000:.1f}ms '
+            f'decoder={(_t_decoder-_t_vision)*1000:.1f}ms '
+            f'postproc={(_t_end-_t_decoder)*1000:.1f}ms '
+            f'total={(_t_end-_t_start)*1000:.1f}ms')
 
     # ----------------------------------------------------------------
     # Output publishing
