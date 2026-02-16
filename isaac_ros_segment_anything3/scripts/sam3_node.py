@@ -18,14 +18,17 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-SAM3 (Segment Anything 3) ROS2 node for text-prompted segmentation.
+SAM3 / EfficientSAM3 ROS2 node for text-prompted segmentation.
+
+Supports both SAM3 (full) and EfficientSAM3 (distilled) models via
+model_type parameter. Both share the same 3-model pipeline:
 
 Pipeline:
-  1. Image -> preprocess (1008x1008) -> vision_encoder (Triton) -> FPN features [cached per frame]
-  2. Text prompt -> tokenize (input_ids + attention_mask, max_len=32)
+  1. Image -> preprocess -> vision_encoder (Triton) -> FPN features [cached per frame]
+  2. Text prompt -> tokenize (input_ids + attention_mask)
      -> text_encoder (Triton) -> text_features + text_mask [cached]
   3. FPN features + prompt_features + prompt_mask -> decoder (Triton)
-     -> pred_masks (288x288), pred_boxes (cx,cy,w,h normalized), pred_logits, presence_logits
+     -> pred_masks, pred_boxes (cx,cy,w,h normalized), pred_logits, presence_logits
   4. Post-process -> publish Detection2DArray + segmentation mask
 
 Topics:
@@ -39,6 +42,7 @@ Topics:
     /sam3/set_text_prompt (SetTextPrompt)
 """
 
+import os
 import threading
 
 import cv2
@@ -61,30 +65,88 @@ from vision_msgs.msg import (
 
 from isaac_ros_segment_anything3_interfaces.srv import SetTextPrompt
 
-# Fixed constants from the ONNX model signatures
-_IMAGE_SIZE = 1008
-_MAX_SEQ_LEN = 32
-_MASK_SIZE = 288
-_NUM_QUERIES = 200
 _MAX_PROMPTS = 3
+
+# Model profiles: model-specific constants for SAM3 and EfficientSAM3.
+# Both share the same 3-model pipeline (vision_encoder + text_encoder + decoder)
+# but differ in model sizes, image resolution, and default Triton model names.
+MODEL_PROFILES = {
+    'sam3': {
+        'image_size': 1008,
+        'max_seq_len': 32,
+        'mean': [0.485, 0.456, 0.406],
+        'std': [0.229, 0.224, 0.225],
+        'default_vision_model': 'sam3_vision_encoder',
+        'default_text_model': 'sam3_text_encoder',
+        'default_decoder_model': 'sam3_decoder',
+    },
+    'efficient_sam3': {
+        'image_size': 1008,
+        'max_seq_len': 32,       # Same CLIP BPE tokenizer
+        'mean': [0.485, 0.456, 0.406],
+        'std': [0.229, 0.224, 0.225],
+        'default_vision_model': 'esam3_vision_encoder',
+        'default_text_model': 'esam3_text_encoder',
+        'default_decoder_model': 'esam3_decoder',
+        'pytorch_builder': 'build_efficientsam3_image_model',
+        'pytorch_builder_kwargs': {
+            'backbone_type': 'tinyvit',
+            'model_name': '11m',
+            'text_encoder_type': 'MobileCLIP-S1',
+        },
+    },
+}
 
 
 class Sam3Node(Node):
-    """ROS2 node for SAM3 text-prompted segmentation via Triton."""
+    """ROS2 node for SAM3/EfficientSAM3 text-prompted segmentation.
+
+    Supports two inference backends:
+      - 'triton': ONNX models via Triton Inference Server (default)
+      - 'pytorch': Direct PyTorch CUDA inference (~16x faster)
+    """
 
     def __init__(self):
         super().__init__('sam3_node')
 
-        # Declare parameters
+        # Load model profile first (determines defaults for other params)
+        self.declare_parameter('model_type', 'sam3')
+        model_type = self.get_parameter(
+            'model_type').get_parameter_value().string_value
+        if model_type not in MODEL_PROFILES:
+            self.get_logger().error(
+                f'Unknown model_type: {model_type}. '
+                f'Valid options: {list(MODEL_PROFILES.keys())}. '
+                f'Falling back to sam3.')
+            model_type = 'sam3'
+        self._model_type = model_type
+        profile = MODEL_PROFILES[model_type]
+
+        # Inference backend: 'triton' (ONNX via Triton) or 'pytorch' (direct CUDA)
+        self.declare_parameter('inference_backend', 'triton')
+        self.declare_parameter('pytorch_checkpoint', '')
+        self.declare_parameter('pytorch_device', 'cuda')
+
+        self._backend = self.get_parameter(
+            'inference_backend').get_parameter_value().string_value
+        self._pytorch_checkpoint = self.get_parameter(
+            'pytorch_checkpoint').get_parameter_value().string_value
+        self._pytorch_device = self.get_parameter(
+            'pytorch_device').get_parameter_value().string_value
+
+        # Declare parameters (defaults from profile)
         self.declare_parameter('triton_server_url', 'localhost:8001')
         self.declare_parameter('model_repository_path', '/tmp/models')
         self.declare_parameter(
-            'vision_encoder_model_name', 'sam3_vision_encoder')
+            'vision_encoder_model_name',
+            profile['default_vision_model'])
         self.declare_parameter(
-            'text_encoder_model_name', 'sam3_text_encoder')
-        self.declare_parameter('decoder_model_name', 'sam3_decoder')
+            'text_encoder_model_name',
+            profile['default_text_model'])
+        self.declare_parameter(
+            'decoder_model_name', profile['default_decoder_model'])
         self.declare_parameter('tokenizer_path', '/tmp/models/tokenizer.json')
-        self.declare_parameter('image_size', _IMAGE_SIZE)
+        self.declare_parameter('image_size', profile['image_size'])
         self.declare_parameter('confidence_threshold', 0.3)
         self.declare_parameter('max_prompts', _MAX_PROMPTS)
 
@@ -107,14 +169,19 @@ class Sam3Node(Node):
             'confidence_threshold').get_parameter_value().double_value
         self._max_prompts = self.get_parameter(
             'max_prompts').get_parameter_value().integer_value
+        self._max_seq_len = profile['max_seq_len']
 
         # Initialize tokenizer
         self._tokenizer = None
         self._init_tokenizer()
 
-        # Initialize Triton client
+        # Initialize inference backend
         self._triton_client = None
-        self._init_triton_client()
+        self._pytorch_model = None
+        if self._backend == 'pytorch':
+            self._init_pytorch_backend()
+        else:
+            self._init_triton_client()
 
         # State (protected by lock for thread safety)
         self._lock = threading.Lock()
@@ -122,9 +189,9 @@ class Sam3Node(Node):
         self._text_features_cache = None   # (text_features, text_mask) tuple
         self._bridge = CvBridge()
 
-        # Image normalization (ImageNet mean/std, same as SAM2)
-        self._mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-        self._std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        # Image normalization from model profile
+        self._mean = np.array(profile['mean'], dtype=np.float32)
+        self._std = np.array(profile['std'], dtype=np.float32)
 
         # Subscriber: input image
         image_qos = QoSProfile(
@@ -147,10 +214,17 @@ class Sam3Node(Node):
             SetTextPrompt, 'sam3/set_text_prompt',
             self._set_text_prompt_callback)
 
-        self.get_logger().info(
-            f'SAM3 node initialized. Triton: {self._triton_url}, '
-            f'Models: {self._vision_model}, {self._text_model}, '
-            f'{self._decoder_model}, image_size={self._image_size}')
+        if self._backend == 'pytorch':
+            self.get_logger().info(
+                f'SAM3 node initialized (model_type={self._model_type}, '
+                f'backend=pytorch, device={self._pytorch_device}, '
+                f'image_size={self._image_size})')
+        else:
+            self.get_logger().info(
+                f'SAM3 node initialized (model_type={self._model_type}, '
+                f'backend=triton, url={self._triton_url}, '
+                f'models=[{self._vision_model}, {self._text_model}, '
+                f'{self._decoder_model}], image_size={self._image_size})')
 
     def _init_tokenizer(self):
         """Initialize the HuggingFace tokenizer."""
@@ -159,11 +233,12 @@ class Sam3Node(Node):
             self._tokenizer = Tokenizer.from_file(self._tokenizer_path)
             # Enable padding and truncation to fixed length
             self._tokenizer.enable_padding(
-                length=_MAX_SEQ_LEN, pad_id=0, pad_token='[PAD]')
-            self._tokenizer.enable_truncation(max_length=_MAX_SEQ_LEN)
+                length=self._max_seq_len, pad_id=0, pad_token='[PAD]')
+            self._tokenizer.enable_truncation(
+                max_length=self._max_seq_len)
             self.get_logger().info(
                 f'Tokenizer loaded from {self._tokenizer_path} '
-                f'(max_seq_len={_MAX_SEQ_LEN})')
+                f'(max_seq_len={self._max_seq_len})')
         except FileNotFoundError:
             self.get_logger().error(
                 f'Tokenizer file not found: {self._tokenizer_path}. '
@@ -199,6 +274,90 @@ class Sam3Node(Node):
             self.get_logger().warn(
                 f'Cannot connect to Triton at {self._triton_url}: {e}. '
                 f'Will retry on first inference request.')
+
+    def _init_pytorch_backend(self):
+        """Initialize PyTorch models for direct CUDA inference."""
+        profile = MODEL_PROFILES[self._model_type]
+        builder_kwargs = profile.get('pytorch_builder_kwargs')
+        if builder_kwargs is None:
+            self.get_logger().error(
+                f'PyTorch backend not supported for model_type='
+                f'{self._model_type}. Use inference_backend:=triton.')
+            return
+
+        try:
+            import torch
+            self._torch = torch
+        except ImportError:
+            self.get_logger().error(
+                'PyTorch not installed. '
+                'Install with: pip install torch')
+            return
+
+        # Resolve checkpoint path
+        checkpoint = self._pytorch_checkpoint
+        if not checkpoint:
+            checkpoint = os.path.join(
+                self._model_repo, 'efficient_sam3.pth')
+        if not os.path.isfile(checkpoint):
+            self.get_logger().error(
+                f'PyTorch checkpoint not found: {checkpoint}. '
+                f'Run download_models.py --inference-backend pytorch')
+            return
+
+        # Import wrapper classes from export script (same directory)
+        try:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            import sys
+            if script_dir not in sys.path:
+                sys.path.insert(0, script_dir)
+            from export_efficient_sam3 import (
+                load_model, VisionEncoderWrapper,
+                TextEncoderWrapper, DecoderWrapper,
+            )
+        except ImportError as e:
+            self.get_logger().error(
+                f'Cannot import export wrappers: {e}. '
+                f'Ensure export_efficient_sam3.py is in scripts/ and '
+                f'efficientsam3 package is installed.')
+            return
+
+        # Build model
+        try:
+            self.get_logger().info(
+                f'Loading PyTorch model from {checkpoint} ...')
+            model = load_model(
+                checkpoint,
+                builder_kwargs['backbone_type'],
+                builder_kwargs['model_name'],
+                builder_kwargs.get('text_encoder_type'),
+            )
+            device = self._pytorch_device
+            model = model.to(device).eval()
+
+            # Create wrapper modules
+            self._vision_wrapper = VisionEncoderWrapper(
+                model.backbone.vision_backbone,
+                scalp=model.backbone.scalp,
+            ).to(device).eval()
+
+            self._text_wrapper = TextEncoderWrapper(
+                model.backbone.language_backbone,
+            ).to(device).eval()
+
+            self._decoder_wrapper = DecoderWrapper(
+                model,
+            ).to(device).eval()
+
+            self._pytorch_model = model
+            self.get_logger().info(
+                f'PyTorch model loaded on {device}')
+
+        except Exception as e:
+            self.get_logger().error(
+                f'Failed to load PyTorch model: {e}')
+            import traceback
+            traceback.print_exc()
 
     # ----------------------------------------------------------------
     # Preprocessing
@@ -240,15 +399,15 @@ class Sam3Node(Node):
         Tokenize text prompts using HuggingFace tokenizer.
 
         Produces both input_ids and attention_mask with fixed sequence
-        length of _MAX_SEQ_LEN (32).
+        length of max_seq_len (from model profile).
 
         Args:
             prompts: List of strings.
 
         Returns:
             Tuple of (input_ids, attention_mask):
-              - input_ids: np.ndarray of shape (num_prompts, 32), int64
-              - attention_mask: np.ndarray of shape (num_prompts, 32), int64
+              - input_ids: np.ndarray of shape (num_prompts, max_seq_len), int64
+              - attention_mask: np.ndarray of shape (num_prompts, max_seq_len), int64
             Returns (None, None) on failure.
         """
         if self._tokenizer is None:
@@ -257,13 +416,14 @@ class Sam3Node(Node):
 
         encodings = self._tokenizer.encode_batch(prompts)
         num_prompts = len(prompts)
+        max_seq_len = self._max_seq_len
         input_ids = np.zeros(
-            (num_prompts, _MAX_SEQ_LEN), dtype=np.int64)
+            (num_prompts, max_seq_len), dtype=np.int64)
         attention_mask = np.zeros(
-            (num_prompts, _MAX_SEQ_LEN), dtype=np.int64)
+            (num_prompts, max_seq_len), dtype=np.int64)
 
         for i, enc in enumerate(encodings):
-            seq_len = min(len(enc.ids), _MAX_SEQ_LEN)
+            seq_len = min(len(enc.ids), max_seq_len)
             input_ids[i, :seq_len] = enc.ids[:seq_len]
             attention_mask[i, :seq_len] = enc.attention_mask[:seq_len]
 
@@ -428,6 +588,80 @@ class Sam3Node(Node):
             return None
 
     # ----------------------------------------------------------------
+    # PyTorch inference
+    # ----------------------------------------------------------------
+
+    def _run_vision_encoder_pytorch(self, image_np):
+        """
+        Run vision encoder via PyTorch.
+
+        Args:
+            image_np: np.ndarray (1, 3, 1008, 1008), float32.
+
+        Returns:
+            Tuple of 4 torch.Tensors on GPU (fpn_feat_0..2, fpn_pos_2),
+            or None on failure.
+        """
+        try:
+            image = self._torch.from_numpy(image_np).to(
+                self._pytorch_device)
+            with self._torch.no_grad():
+                return self._vision_wrapper(image)
+        except Exception as e:
+            self.get_logger().error(
+                f'PyTorch vision encoder failed: {e}')
+            return None
+
+    def _run_text_encoder_pytorch(self, input_ids_np):
+        """
+        Run text encoder via PyTorch.
+
+        Args:
+            input_ids_np: np.ndarray (num_prompts, 32), int64.
+
+        Returns:
+            Tuple of (text_features, text_mask) as torch.Tensors on GPU,
+            or None on failure.
+        """
+        try:
+            ids = self._torch.from_numpy(input_ids_np).to(
+                self._pytorch_device)
+            with self._torch.no_grad():
+                return self._text_wrapper(ids)
+        except Exception as e:
+            self.get_logger().error(
+                f'PyTorch text encoder failed: {e}')
+            return None
+
+    def _run_decoder_pytorch(self, fpn_tuple, prompt_features, prompt_mask):
+        """
+        Run decoder via PyTorch.
+
+        Args:
+            fpn_tuple: Tuple of 4 torch.Tensors on GPU.
+            prompt_features: torch.Tensor (1, 32, 256) on GPU.
+            prompt_mask: torch.Tensor (1, 32) bool on GPU.
+
+        Returns:
+            Tuple of (pred_masks, pred_boxes, pred_logits, presence_logits)
+            as np.ndarrays, or None on failure.
+        """
+        try:
+            with self._torch.no_grad():
+                masks, boxes, logits, presence = self._decoder_wrapper(
+                    *fpn_tuple, prompt_features, prompt_mask)
+            return (
+                masks.cpu().numpy(),
+                boxes.cpu().numpy(),
+                logits.cpu().numpy(),
+                presence.cpu().numpy(),
+            )
+        except Exception as e:
+            self.get_logger().error(
+                f'PyTorch decoder failed: {e}')
+            return None
+
+    # ----------------------------------------------------------------
     # Callbacks
     # ----------------------------------------------------------------
 
@@ -491,9 +725,13 @@ class Sam3Node(Node):
             if not self._current_prompts:
                 self.get_logger().debug('No prompts set, skipping')
                 return
-            if self._triton_client is None or self._tokenizer is None:
+            backend_ready = (
+                self._pytorch_model is not None
+                if self._backend == 'pytorch'
+                else self._triton_client is not None)
+            if not backend_ready or self._tokenizer is None:
                 self.get_logger().warn(
-                    'Triton client or tokenizer not ready, skipping')
+                    'Inference backend or tokenizer not ready, skipping')
                 return
             current_prompts = list(self._current_prompts)
             text_cache = self._text_features_cache
@@ -516,10 +754,12 @@ class Sam3Node(Node):
         preprocessed = self._preprocess_image(cv_image)
 
         # 2. Vision encoder (always run for each new frame)
-        vision_result = self._run_vision_encoder(preprocessed)
+        if self._backend == 'pytorch':
+            vision_result = self._run_vision_encoder_pytorch(preprocessed)
+        else:
+            vision_result = self._run_vision_encoder(preprocessed)
         if vision_result is None:
             return
-        fpn_feat_0, fpn_feat_1, fpn_feat_2, fpn_pos_2 = vision_result
 
         # 3. Text encoder (cached until prompt changes)
         if text_cache is not None:
@@ -528,7 +768,11 @@ class Sam3Node(Node):
             input_ids, attention_mask = self._tokenize_text(current_prompts)
             if input_ids is None:
                 return
-            text_result = self._run_text_encoder(input_ids, attention_mask)
+            if self._backend == 'pytorch':
+                text_result = self._run_text_encoder_pytorch(input_ids)
+            else:
+                text_result = self._run_text_encoder(
+                    input_ids, attention_mask)
             if text_result is None:
                 return
             text_features, text_mask = text_result
@@ -538,20 +782,29 @@ class Sam3Node(Node):
                 if self._current_prompts == current_prompts:
                     self._text_features_cache = (text_features, text_mask)
 
-        # 4. Decoder: run per-prompt (batch=1) since ONNX model
-        #    expects batch=1 for prompt inputs.
+        # 4. Decoder: run per-prompt (batch=1).
         all_masks = []
         all_boxes = []
         all_logits = []
         all_presence = []
 
-        for p_idx in range(text_features.shape[0]):
-            pf = text_features[p_idx:p_idx + 1].astype(np.float32)
-            pm = text_mask[p_idx:p_idx + 1].astype(bool)
-
-            decoder_result = self._run_decoder(
-                fpn_feat_0, fpn_feat_1, fpn_feat_2, fpn_pos_2,
-                pf, pm)
+        num_prompts = text_features.shape[0]
+        for p_idx in range(num_prompts):
+            if self._backend == 'pytorch':
+                # GPU tensors: slice keeps tensor on device
+                pf = text_features[p_idx:p_idx + 1]
+                pm = text_mask[p_idx:p_idx + 1]
+                decoder_result = self._run_decoder_pytorch(
+                    vision_result, pf, pm)
+            else:
+                # Triton: numpy arrays
+                fpn_feat_0, fpn_feat_1, fpn_feat_2, fpn_pos_2 = \
+                    vision_result
+                pf = text_features[p_idx:p_idx + 1].astype(np.float32)
+                pm = text_mask[p_idx:p_idx + 1].astype(bool)
+                decoder_result = self._run_decoder(
+                    fpn_feat_0, fpn_feat_1, fpn_feat_2, fpn_pos_2,
+                    pf, pm)
             if decoder_result is None:
                 continue
             masks, boxes, logits, presence = decoder_result

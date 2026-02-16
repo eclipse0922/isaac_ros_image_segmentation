@@ -32,6 +32,7 @@ ament_python_install_package(${PROJECT_NAME})
 install(PROGRAMS scripts/sam3_node.py DESTINATION lib/${PROJECT_NAME})
 install(PROGRAMS scripts/download_models.py DESTINATION lib/${PROJECT_NAME})
 install(PROGRAMS scripts/set_text_prompt.py DESTINATION lib/${PROJECT_NAME})
+install(PROGRAMS scripts/export_efficient_sam3.py DESTINATION lib/${PROJECT_NAME})
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)

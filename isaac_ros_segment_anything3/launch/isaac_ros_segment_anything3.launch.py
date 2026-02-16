@@ -16,11 +16,21 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Standalone launch file for SAM3 text-prompted segmentation.
+Standalone launch file for SAM3/EfficientSAM3 text-prompted segmentation.
 
 Usage:
+    # SAM3 (default)
     ros2 launch isaac_ros_segment_anything3 isaac_ros_segment_anything3.launch.py
 
+    # EfficientSAM3
+    ros2 launch isaac_ros_segment_anything3 isaac_ros_segment_anything3.launch.py \
+        model_type:=efficient_sam3
+
+    # EfficientSAM3 with PyTorch backend (~16x faster)
+    ros2 launch isaac_ros_segment_anything3 isaac_ros_segment_anything3.launch.py \
+        model_type:=efficient_sam3 inference_backend:=pytorch
+
+    # Custom configuration
     ros2 launch isaac_ros_segment_anything3 isaac_ros_segment_anything3.launch.py \
         triton_server_url:=localhost:8001 \
         model_repository_path:=/tmp/models \
@@ -35,6 +45,11 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     # Declare launch arguments
+    model_type_arg = DeclareLaunchArgument(
+        'model_type',
+        default_value='sam3',
+        description='Model type: sam3 or efficient_sam3')
+
     triton_server_url_arg = DeclareLaunchArgument(
         'triton_server_url',
         default_value='localhost:8001',
@@ -75,6 +90,21 @@ def generate_launch_description():
         default_value='0.3',
         description='Confidence threshold for filtering detections')
 
+    inference_backend_arg = DeclareLaunchArgument(
+        'inference_backend',
+        default_value='triton',
+        description='Inference backend: triton or pytorch')
+
+    pytorch_checkpoint_arg = DeclareLaunchArgument(
+        'pytorch_checkpoint',
+        default_value='',
+        description='PyTorch checkpoint path (empty=auto)')
+
+    pytorch_device_arg = DeclareLaunchArgument(
+        'pytorch_device',
+        default_value='cuda',
+        description='PyTorch device (cuda or cpu)')
+
     input_image_topic_arg = DeclareLaunchArgument(
         'input_image_topic',
         default_value='image_raw',
@@ -86,6 +116,8 @@ def generate_launch_description():
         executable='sam3_node.py',
         name='sam3_node',
         parameters=[{
+            'model_type':
+                LaunchConfiguration('model_type'),
             'triton_server_url':
                 LaunchConfiguration('triton_server_url'),
             'model_repository_path':
@@ -102,6 +134,12 @@ def generate_launch_description():
                 LaunchConfiguration('image_size'),
             'confidence_threshold':
                 LaunchConfiguration('confidence_threshold'),
+            'inference_backend':
+                LaunchConfiguration('inference_backend'),
+            'pytorch_checkpoint':
+                LaunchConfiguration('pytorch_checkpoint'),
+            'pytorch_device':
+                LaunchConfiguration('pytorch_device'),
         }],
         remappings=[
             ('image_raw', LaunchConfiguration('input_image_topic')),
@@ -110,6 +148,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        model_type_arg,
         triton_server_url_arg,
         model_repository_path_arg,
         vision_encoder_model_name_arg,
@@ -118,6 +157,9 @@ def generate_launch_description():
         tokenizer_path_arg,
         image_size_arg,
         confidence_threshold_arg,
+        inference_backend_arg,
+        pytorch_checkpoint_arg,
+        pytorch_device_arg,
         input_image_topic_arg,
         sam3_node,
     ])

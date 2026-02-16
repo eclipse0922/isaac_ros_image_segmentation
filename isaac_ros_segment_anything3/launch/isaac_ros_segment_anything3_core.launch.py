@@ -45,17 +45,28 @@ class IsaacROSSegmentAnything3LaunchFragment(IsaacROSLaunchFragment):
     def get_launch_actions(interface_specs: Dict[str, Any]) \
             -> Dict[str, launch.actions.OpaqueFunction]:
 
+        sam3_model_type = LaunchConfiguration('sam3_model_type')
         sam3_triton_url = LaunchConfiguration('sam3_triton_url')
         sam3_model_repo = LaunchConfiguration('sam3_model_repo')
         sam3_tokenizer_path = LaunchConfiguration('sam3_tokenizer_path')
         sam3_confidence_threshold = LaunchConfiguration(
             'sam3_confidence_threshold')
         sam3_image_size = LaunchConfiguration('sam3_image_size')
+        sam3_inference_backend = LaunchConfiguration(
+            'sam3_inference_backend')
+        sam3_pytorch_checkpoint = LaunchConfiguration(
+            'sam3_pytorch_checkpoint')
+        sam3_pytorch_device = LaunchConfiguration(
+            'sam3_pytorch_device')
 
         img_topic = interface_specs.get(
             'subscribed_topics', {}).get('image', 'image_rect')
 
         return {
+            'sam3_model_type': DeclareLaunchArgument(
+                'sam3_model_type',
+                default_value='sam3',
+                description='Model type: sam3 or efficient_sam3'),
             'sam3_triton_url': DeclareLaunchArgument(
                 'sam3_triton_url',
                 default_value='localhost:8001',
@@ -76,16 +87,32 @@ class IsaacROSSegmentAnything3LaunchFragment(IsaacROSLaunchFragment):
                 'sam3_image_size',
                 default_value='1024',
                 description='SAM3 model input image size'),
+            'sam3_inference_backend': DeclareLaunchArgument(
+                'sam3_inference_backend',
+                default_value='triton',
+                description='Inference backend: triton or pytorch'),
+            'sam3_pytorch_checkpoint': DeclareLaunchArgument(
+                'sam3_pytorch_checkpoint',
+                default_value='',
+                description='PyTorch checkpoint path (empty=auto)'),
+            'sam3_pytorch_device': DeclareLaunchArgument(
+                'sam3_pytorch_device',
+                default_value='cuda',
+                description='PyTorch device (cuda or cpu)'),
             'sam3_node': Node(
                 package='isaac_ros_segment_anything3',
                 executable='sam3_node.py',
                 name='sam3_node',
                 parameters=[{
+                    'model_type': sam3_model_type,
                     'triton_server_url': sam3_triton_url,
                     'model_repository_path': sam3_model_repo,
                     'tokenizer_path': sam3_tokenizer_path,
                     'confidence_threshold': sam3_confidence_threshold,
                     'image_size': sam3_image_size,
+                    'inference_backend': sam3_inference_backend,
+                    'pytorch_checkpoint': sam3_pytorch_checkpoint,
+                    'pytorch_device': sam3_pytorch_device,
                 }],
                 remappings=[
                     ('image_raw', img_topic),
