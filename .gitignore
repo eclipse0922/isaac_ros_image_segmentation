@@ -4,3 +4,9 @@
 # Ignore TensorRT plan files
 *.plan
 *.engine
+
+# Third-party clones (for reference, not tracked)
+third_party/
+
+# Test results
+test_results/

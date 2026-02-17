@@ -85,8 +85,9 @@ MODEL_PROFILES = {
     'efficient_sam3': {
         'image_size': 1008,
         'max_seq_len': 32,       # Same CLIP BPE tokenizer
-        'mean': [0.485, 0.456, 0.406],
-        'std': [0.229, 0.224, 0.225],
+        'mean': [0.5, 0.5, 0.5],
+        'std': [0.5, 0.5, 0.5],
+        'stretch_resize': True,  # Upstream uses stretch, not aspect-pad
         'default_vision_model': 'esam3_vision_encoder',
         'default_text_model': 'esam3_text_encoder',
         'default_decoder_model': 'esam3_decoder',
@@ -149,7 +150,7 @@ class Sam3Node(Node):
             'decoder_model_name', profile['default_decoder_model'])
         self.declare_parameter('tokenizer_path', '/tmp/models/tokenizer.json')
         self.declare_parameter('image_size', profile['image_size'])
-        self.declare_parameter('confidence_threshold', 0.3)
+        self.declare_parameter('confidence_threshold', 0.5)
         self.declare_parameter('max_prompts', _MAX_PROMPTS)
 
         # Read parameters
@@ -194,6 +195,7 @@ class Sam3Node(Node):
         # Image normalization from model profile
         self._mean = np.array(profile['mean'], dtype=np.float32)
         self._std = np.array(profile['std'], dtype=np.float32)
+        self._stretch_resize = profile.get('stretch_resize', False)
 
         # Subscriber: input image
         image_qos = QoSProfile(
@@ -280,7 +282,13 @@ class Sam3Node(Node):
                 f'Will retry on first inference request.')
 
     def _init_pytorch_backend(self):
-        """Initialize PyTorch models for direct CUDA inference."""
+        """Initialize PyTorch models for direct CUDA inference.
+
+        Uses the model's own forward_grounding() method (matching upstream
+        Sam3Processor) instead of our ONNX export wrappers. This ensures
+        the geometry encoder properly processes prompts with cross-attention
+        to image features before the main decoder runs.
+        """
         profile = MODEL_PROFILES[self._model_type]
         builder_kwargs = profile.get('pytorch_builder_kwargs')
         if builder_kwargs is None:
@@ -309,53 +317,48 @@ class Sam3Node(Node):
                 f'Run download_models.py --inference-backend pytorch')
             return
 
-        # Import wrapper classes from export script (same directory)
+        # Build model using sam3 package directly
         try:
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            import sys
-            if script_dir not in sys.path:
-                sys.path.insert(0, script_dir)
-            from export_efficient_sam3 import (
-                load_model, VisionEncoderWrapper,
-                TextEncoderWrapper, DecoderWrapper,
-            )
+            from sam3 import build_efficientsam3_image_model
+            from sam3.model.data_misc import FindStage
         except ImportError as e:
             self.get_logger().error(
-                f'Cannot import export wrappers: {e}. '
-                f'Ensure export_efficient_sam3.py is in scripts/ and '
-                f'efficientsam3 package is installed.')
+                f'Cannot import sam3 package: {e}. '
+                f'Install with: pip install git+https://github.com/'
+                f'SimonZeng7108/efficientsam3.git')
             return
 
-        # Build model
         try:
             self.get_logger().info(
                 f'Loading PyTorch model from {checkpoint} ...')
-            model = load_model(
-                checkpoint,
-                builder_kwargs['backbone_type'],
-                builder_kwargs['model_name'],
-                builder_kwargs.get('text_encoder_type'),
-            )
             device = self._pytorch_device
-            model = model.to(device).eval()
-
-            # Create wrapper modules
-            self._vision_wrapper = VisionEncoderWrapper(
-                model.backbone.vision_backbone,
-                scalp=model.backbone.scalp,
-            ).to(device).eval()
-
-            self._text_wrapper = TextEncoderWrapper(
-                model.backbone.language_backbone,
-            ).to(device).eval()
-
-            self._decoder_wrapper = DecoderWrapper(
-                model,
-            ).to(device).eval()
+            model = build_efficientsam3_image_model(
+                checkpoint_path=checkpoint,
+                backbone_type=builder_kwargs['backbone_type'],
+                model_name=builder_kwargs['model_name'],
+                text_encoder_type=builder_kwargs.get('text_encoder_type'),
+                device=device,
+            )
 
             self._pytorch_model = model
+
+            # Pre-create FindStage for single-image inference
+            # (reused across frames, only text_ids changes per prompt)
+            self._find_stage = FindStage(
+                img_ids=self._torch.tensor(
+                    [0], device=device, dtype=self._torch.long),
+                text_ids=self._torch.tensor(
+                    [0], device=device, dtype=self._torch.long),
+                input_boxes=None,
+                input_boxes_mask=None,
+                input_boxes_label=None,
+                input_points=None,
+                input_points_mask=None,
+            )
+
             self.get_logger().info(
-                f'PyTorch model loaded on {device}')
+                f'PyTorch model loaded on {device} '
+                f'(using model.forward_grounding directly)')
 
         except Exception as e:
             self.get_logger().error(
@@ -371,8 +374,9 @@ class Sam3Node(Node):
         """
         Preprocess image for SAM3 vision encoder.
 
-        Following the SAM2 pipeline pattern:
-          resize (keep aspect ratio) -> pad (bottom-right) -> normalize -> CHW
+        Two modes depending on model profile:
+          stretch: resize to square (upstream EfficientSAM3 convention)
+          pad:     aspect-preserving resize + bottom-right padding (SAM2)
 
         Args:
             cv_image: RGB uint8 image (H, W, 3).
@@ -380,23 +384,28 @@ class Sam3Node(Node):
         Returns:
             np.ndarray of shape (1, 3, image_size, image_size), float32.
         """
-        h, w = cv_image.shape[:2]
-        scale = self._image_size / max(h, w)
-        new_h = int(h * scale)
-        new_w = int(w * scale)
-        resized = cv2.resize(cv_image, (new_w, new_h),
-                             interpolation=cv2.INTER_LINEAR)
+        sz = self._image_size
 
-        # Pad to image_size x image_size (bottom-right padding)
-        padded = np.zeros(
-            (self._image_size, self._image_size, 3), dtype=np.float32)
-        padded[:new_h, :new_w] = resized.astype(np.float32) / 255.0
+        if self._stretch_resize:
+            # Upstream EfficientSAM3: stretch to square, normalize to [-1, 1]
+            resized = cv2.resize(cv_image, (sz, sz),
+                                 interpolation=cv2.INTER_LINEAR)
+            img = resized.astype(np.float32) / 255.0
+        else:
+            # SAM2/SAM3 convention: aspect-preserving + bottom-right pad
+            h, w = cv_image.shape[:2]
+            scale = sz / max(h, w)
+            new_h, new_w = int(h * scale), int(w * scale)
+            resized = cv2.resize(cv_image, (new_w, new_h),
+                                 interpolation=cv2.INTER_LINEAR)
+            img = np.zeros((sz, sz, 3), dtype=np.float32)
+            img[:new_h, :new_w] = resized.astype(np.float32) / 255.0
 
-        # Normalize with ImageNet mean/std
-        padded = (padded - self._mean) / self._std
+        # Normalize (mean/std from model profile)
+        img = (img - self._mean) / self._std
 
         # HWC -> CHW -> NCHW
-        return padded.transpose(2, 0, 1)[np.newaxis].astype(np.float32)
+        return img.transpose(2, 0, 1)[np.newaxis].astype(np.float32)
 
     def _tokenize_text(self, prompts):
         """
@@ -595,75 +604,79 @@ class Sam3Node(Node):
     # PyTorch inference
     # ----------------------------------------------------------------
 
-    def _run_vision_encoder_pytorch(self, image_np):
+    def _run_pytorch_forward(self, image_np, prompts, text_cache):
         """
-        Run vision encoder via PyTorch.
+        Run the full EfficientSAM3 pipeline via PyTorch model directly.
+
+        Uses model.forward_grounding() which matches upstream Sam3Processor
+        exactly, including proper geometry encoder CLS processing with
+        cross-attention to image features.
 
         Args:
             image_np: np.ndarray (1, 3, 1008, 1008), float32.
+            prompts: List of text prompt strings.
+            text_cache: Cached backbone_out text fields, or None.
 
         Returns:
-            Tuple of 4 torch.Tensors on GPU (fpn_feat_0..2, fpn_pos_2),
-            or None on failure.
+            Tuple of (all_results, text_cache_new):
+              all_results: List of dicts per prompt, each containing:
+                pred_masks (np.ndarray), pred_boxes, pred_logits, presence
+              text_cache_new: Updated text cache dict for reuse.
+            Returns (None, text_cache) on failure.
         """
         try:
-            image = self._torch.from_numpy(image_np).to(
-                self._pytorch_device)
-            with self._torch.no_grad():
-                return self._vision_wrapper(image)
+            torch = self._torch
+            device = self._pytorch_device
+            model = self._pytorch_model
+
+            image = torch.from_numpy(image_np).to(device)
+
+            with torch.inference_mode():
+                # 1. Vision encoder (run once per frame)
+                backbone_out = model.backbone.forward_image(image)
+
+                # 2. Text encoder (cached until prompts change)
+                if text_cache is not None:
+                    backbone_out.update(text_cache)
+                    text_cache_new = text_cache
+                else:
+                    text_outputs = model.backbone.forward_text(
+                        prompts, device=device)
+                    backbone_out.update(text_outputs)
+                    text_cache_new = text_outputs
+
+                # 3. Run decoder per prompt via forward_grounding
+                all_results = []
+                for p_idx in range(len(prompts)):
+                    # Set text_ids to select this prompt
+                    find_stage = self._find_stage
+                    find_stage.text_ids = torch.tensor(
+                        [p_idx], device=device, dtype=torch.long)
+
+                    geo_prompt = model._get_dummy_prompt()
+
+                    outputs = model.forward_grounding(
+                        backbone_out=backbone_out,
+                        find_input=find_stage,
+                        geometric_prompt=geo_prompt,
+                        find_target=None,
+                    )
+
+                    all_results.append({
+                        'pred_masks': outputs['pred_masks'].cpu().numpy(),
+                        'pred_boxes': outputs['pred_boxes'].cpu().numpy(),
+                        'pred_logits': outputs['pred_logits'].cpu().numpy(),
+                        'presence': outputs['presence_logit_dec'].cpu().numpy(),
+                    })
+
+            return all_results, text_cache_new
+
         except Exception as e:
             self.get_logger().error(
-                f'PyTorch vision encoder failed: {e}')
-            return None
-
-    def _run_text_encoder_pytorch(self, input_ids_np):
-        """
-        Run text encoder via PyTorch.
-
-        Args:
-            input_ids_np: np.ndarray (num_prompts, 32), int64.
-
-        Returns:
-            Tuple of (text_features, text_mask) as torch.Tensors on GPU,
-            or None on failure.
-        """
-        try:
-            ids = self._torch.from_numpy(input_ids_np).to(
-                self._pytorch_device)
-            with self._torch.no_grad():
-                return self._text_wrapper(ids)
-        except Exception as e:
-            self.get_logger().error(
-                f'PyTorch text encoder failed: {e}')
-            return None
-
-    def _run_decoder_pytorch(self, fpn_tuple, prompt_features, prompt_mask):
-        """
-        Run decoder via PyTorch.
-
-        Args:
-            fpn_tuple: Tuple of 4 torch.Tensors on GPU.
-            prompt_features: torch.Tensor (1, 32, 256) on GPU.
-            prompt_mask: torch.Tensor (1, 32) bool on GPU.
-
-        Returns:
-            Tuple of (pred_masks, pred_boxes, pred_logits, presence_logits)
-            as np.ndarrays, or None on failure.
-        """
-        try:
-            with self._torch.no_grad():
-                masks, boxes, logits, presence = self._decoder_wrapper(
-                    *fpn_tuple, prompt_features, prompt_mask)
-            return (
-                masks.cpu().numpy(),
-                boxes.cpu().numpy(),
-                logits.cpu().numpy(),
-                presence.cpu().numpy(),
-            )
-        except Exception as e:
-            self.get_logger().error(
-                f'PyTorch decoder failed: {e}')
-            return None
+                f'PyTorch forward failed: {e}')
+            import traceback
+            traceback.print_exc()
+            return None, text_cache
 
     # ----------------------------------------------------------------
     # Callbacks
@@ -733,7 +746,11 @@ class Sam3Node(Node):
                 self._pytorch_model is not None
                 if self._backend == 'pytorch'
                 else self._triton_client is not None)
-            if not backend_ready or self._tokenizer is None:
+            # PyTorch uses model.backbone.forward_text() (has own tokenizer).
+            # Triton needs our external HuggingFace tokenizer.
+            tokenizer_ready = (
+                self._backend == 'pytorch' or self._tokenizer is not None)
+            if not backend_ready or not tokenizer_ready:
                 self.get_logger().warn(
                     'Inference backend or tokenizer not ready, skipping')
                 return
@@ -743,7 +760,7 @@ class Sam3Node(Node):
 
         _t_start = _time.perf_counter()
 
-        self.get_logger().info(
+        self.get_logger().debug(
             f'Processing {msg.width}x{msg.height} image with '
             f'prompts={current_prompts}')
 
@@ -761,115 +778,163 @@ class Sam3Node(Node):
         preprocessed = self._preprocess_image(cv_image)
         _t_preproc = _time.perf_counter()
 
-        # 2. Vision encoder (always run for each new frame)
         if self._backend == 'pytorch':
-            vision_result = self._run_vision_encoder_pytorch(preprocessed)
-        else:
-            vision_result = self._run_vision_encoder(preprocessed)
-        if vision_result is None:
-            return
-        _t_vision = _time.perf_counter()
+            # PyTorch: use model.forward_grounding() directly.
+            # This matches upstream Sam3Processor exactly, including
+            # proper geometry encoder CLS processing.
+            text_cache_hit = (text_cache is not None)
 
-        # 3. Text encoder (cached until prompt changes)
-        _t_text_start = _time.perf_counter()
-        text_cache_hit = (text_cache is not None)
-
-        if text_cache is not None:
-            text_features, text_mask = text_cache
-        else:
-            input_ids, attention_mask = self._tokenize_text(current_prompts)
-            if input_ids is None:
+            results, text_cache_new = self._run_pytorch_forward(
+                preprocessed, current_prompts, text_cache)
+            if results is None:
                 return
-            if self._backend == 'pytorch':
-                text_result = self._run_text_encoder_pytorch(input_ids)
+
+            _t_model = _time.perf_counter()
+
+            # Update text cache under lock
+            if not text_cache_hit and text_cache_new is not None:
+                with self._lock:
+                    if self._current_prompts == current_prompts:
+                        self._text_features_cache = text_cache_new
+
+            # Stack results across prompts
+            num_prompts = len(results)
+            all_masks = []
+            all_boxes = []
+            all_logits = []
+            all_presence = []
+            for r in results:
+                # forward_grounding output shapes:
+                #   pred_masks: [1, 200, 288, 288]
+                #   pred_boxes: [1, 200, 4]
+                #   pred_logits: [1, 200, 1]
+                #   presence: [1, 1] (per-text-prompt, not per-query)
+                all_masks.append(r['pred_masks'][0])       # (200, 288, 288)
+                all_boxes.append(r['pred_boxes'][0])       # (200, 4)
+                all_logits.append(r['pred_logits'][0])     # (200, 1)
+                all_presence.append(r['presence'][0])      # (1,)
+
+            pred_masks = np.stack(all_masks)       # (N, 200, 288, 288)
+            pred_boxes = np.stack(all_boxes)       # (N, 200, 4)
+            pred_logits = np.stack(all_logits)     # (N, 200, 1)
+            presence_logits = np.stack(all_presence)  # (N, 1)
+
+            # 5. Post-process and publish
+            self._publish_results(
+                msg.header, orig_h, orig_w,
+                pred_masks, pred_boxes, pred_logits, presence_logits,
+                current_prompts, confidence_threshold)
+            _t_end = _time.perf_counter()
+
+            # Timing (combined vision+text+decoder for PyTorch path)
+            timing_msg = Sam3Timing()
+            timing_msg.header.stamp = self.get_clock().now().to_msg()
+            timing_msg.cvbridge_ms = (_t_cvbridge - _t_start) * 1000.0
+            timing_msg.preprocess_ms = (_t_preproc - _t_cvbridge) * 1000.0
+            timing_msg.vision_encoder_ms = 0.0  # combined in model_ms
+            timing_msg.text_encoder_ms = 0.0
+            timing_msg.text_encoder_cache_hit = text_cache_hit
+            timing_msg.decoder_ms = (_t_model - _t_preproc) * 1000.0
+            timing_msg.num_prompts = num_prompts
+            timing_msg.postprocess_ms = (_t_end - _t_model) * 1000.0
+            timing_msg.total_ms = (_t_end - _t_start) * 1000.0
+            timing_msg.backend = self._backend
+            timing_msg.model_type = self._model_type
+
+        else:
+            # Triton: 3-stage pipeline (vision → text → decoder)
+            # 2. Vision encoder
+            vision_result = self._run_vision_encoder(preprocessed)
+            if vision_result is None:
+                return
+            _t_vision = _time.perf_counter()
+
+            # 3. Text encoder (cached until prompt changes)
+            _t_text_start = _time.perf_counter()
+            text_cache_hit = (text_cache is not None)
+
+            if text_cache is not None:
+                text_features, text_mask = text_cache
             else:
+                input_ids, attention_mask = self._tokenize_text(
+                    current_prompts)
+                if input_ids is None:
+                    return
                 text_result = self._run_text_encoder(
                     input_ids, attention_mask)
-            if text_result is None:
-                return
-            text_features, text_mask = text_result
-            # Store back under lock
-            with self._lock:
-                # Only update if prompts haven't changed meanwhile
-                if self._current_prompts == current_prompts:
-                    self._text_features_cache = (text_features, text_mask)
+                if text_result is None:
+                    return
+                text_features, text_mask = text_result
+                with self._lock:
+                    if self._current_prompts == current_prompts:
+                        self._text_features_cache = (
+                            text_features, text_mask)
 
-        _t_text_end = _time.perf_counter()
+            _t_text_end = _time.perf_counter()
 
-        # 4. Decoder: run per-prompt (batch=1).
-        all_masks = []
-        all_boxes = []
-        all_logits = []
-        all_presence = []
+            # 4. Decoder: run per-prompt (batch=1).
+            all_masks = []
+            all_boxes = []
+            all_logits = []
+            all_presence = []
 
-        num_prompts = text_features.shape[0]
-        for p_idx in range(num_prompts):
-            if self._backend == 'pytorch':
-                # GPU tensors: slice keeps tensor on device
-                pf = text_features[p_idx:p_idx + 1]
-                pm = text_mask[p_idx:p_idx + 1]
-                decoder_result = self._run_decoder_pytorch(
-                    vision_result, pf, pm)
-            else:
-                # Triton: numpy arrays
-                fpn_feat_0, fpn_feat_1, fpn_feat_2, fpn_pos_2 = \
-                    vision_result
+            num_prompts = text_features.shape[0]
+            fpn_feat_0, fpn_feat_1, fpn_feat_2, fpn_pos_2 = vision_result
+            for p_idx in range(num_prompts):
                 pf = text_features[p_idx:p_idx + 1].astype(np.float32)
                 pm = text_mask[p_idx:p_idx + 1].astype(bool)
                 decoder_result = self._run_decoder(
                     fpn_feat_0, fpn_feat_1, fpn_feat_2, fpn_pos_2,
                     pf, pm)
-            if decoder_result is None:
-                continue
-            masks, boxes, logits, presence = decoder_result
-            all_masks.append(masks[0])       # (200, 288, 288)
-            all_boxes.append(boxes[0])       # (200, 4)
-            all_logits.append(logits[0])     # (200,)
-            all_presence.append(presence[0])  # (1,)
+                if decoder_result is None:
+                    continue
+                masks, boxes, logits, presence = decoder_result
+                all_masks.append(masks[0])
+                all_boxes.append(boxes[0])
+                all_logits.append(logits[0])
+                all_presence.append(presence[0])
 
-        _t_decoder = _time.perf_counter()
+            _t_decoder = _time.perf_counter()
 
-        if not all_masks:
-            return
+            if not all_masks:
+                return
 
-        pred_masks = np.stack(all_masks)       # (N, 200, 288, 288)
-        pred_boxes = np.stack(all_boxes)       # (N, 200, 4)
-        pred_logits = np.stack(all_logits)     # (N, 200)
-        presence_logits = np.stack(all_presence)  # (N, 1)
+            pred_masks = np.stack(all_masks)
+            pred_boxes = np.stack(all_boxes)
+            pred_logits = np.stack(all_logits)
+            presence_logits = np.stack(all_presence)
 
-        # 5. Post-process and publish
-        self._publish_results(
-            msg.header, orig_h, orig_w,
-            pred_masks, pred_boxes, pred_logits, presence_logits,
-            current_prompts, confidence_threshold)
-        _t_end = _time.perf_counter()
+            # 5. Post-process and publish
+            self._publish_results(
+                msg.header, orig_h, orig_w,
+                pred_masks, pred_boxes, pred_logits, presence_logits,
+                current_prompts, confidence_threshold)
+            _t_end = _time.perf_counter()
 
-        # Create and publish timing message
-        timing_msg = Sam3Timing()
-        timing_msg.header.stamp = self.get_clock().now().to_msg()
-        timing_msg.cvbridge_ms = (_t_cvbridge - _t_start) * 1000.0
-        timing_msg.preprocess_ms = (_t_preproc - _t_cvbridge) * 1000.0
-        timing_msg.vision_encoder_ms = (_t_vision - _t_preproc) * 1000.0
-        timing_msg.text_encoder_ms = (_t_text_end - _t_text_start) * 1000.0
-        timing_msg.text_encoder_cache_hit = text_cache_hit
-        # Decoder timing excludes text encoder time
-        timing_msg.decoder_ms = (
-            _t_decoder - _t_vision - (_t_text_end - _t_text_start)) * 1000.0
-        timing_msg.num_prompts = num_prompts
-        timing_msg.postprocess_ms = (_t_end - _t_decoder) * 1000.0
-        timing_msg.total_ms = (_t_end - _t_start) * 1000.0
-        timing_msg.backend = self._backend
-        timing_msg.model_type = self._model_type
+            timing_msg = Sam3Timing()
+            timing_msg.header.stamp = self.get_clock().now().to_msg()
+            timing_msg.cvbridge_ms = (_t_cvbridge - _t_start) * 1000.0
+            timing_msg.preprocess_ms = (_t_preproc - _t_cvbridge) * 1000.0
+            timing_msg.vision_encoder_ms = (
+                _t_vision - _t_preproc) * 1000.0
+            timing_msg.text_encoder_ms = (
+                _t_text_end - _t_text_start) * 1000.0
+            timing_msg.text_encoder_cache_hit = text_cache_hit
+            timing_msg.decoder_ms = (
+                _t_decoder - _t_vision
+                - (_t_text_end - _t_text_start)) * 1000.0
+            timing_msg.num_prompts = num_prompts
+            timing_msg.postprocess_ms = (_t_end - _t_decoder) * 1000.0
+            timing_msg.total_ms = (_t_end - _t_start) * 1000.0
+            timing_msg.backend = self._backend
+            timing_msg.model_type = self._model_type
 
         self._timing_pub.publish(timing_msg)
 
-        # Keep existing log for convenience
         self.get_logger().info(
             f'Timing: cvbridge={timing_msg.cvbridge_ms:.1f}ms '
             f'preproc={timing_msg.preprocess_ms:.1f}ms '
-            f'vision={timing_msg.vision_encoder_ms:.1f}ms '
-            f'text={timing_msg.text_encoder_ms:.1f}ms(cache={text_cache_hit}) '
-            f'decoder={timing_msg.decoder_ms:.1f}ms '
+            f'model={timing_msg.decoder_ms:.1f}ms '
             f'postproc={timing_msg.postprocess_ms:.1f}ms '
             f'total={timing_msg.total_ms:.1f}ms')
 
@@ -878,31 +943,35 @@ class Sam3Node(Node):
     # ----------------------------------------------------------------
 
     @staticmethod
-    def _cxcywh_to_xyxy(boxes, orig_w, orig_h, image_size):
+    def _cxcywh_to_xyxy(boxes, orig_w, orig_h, image_size, stretch):
         """
         Convert normalized [cx, cy, w, h] boxes to pixel [x1, y1, x2, y2].
-
-        Boxes are normalized against the square model input
-        (image_size x image_size) after top-left aligned padding.
-        To map back to original image coordinates, invert the same scale used
-        by preprocessing and then clip to original bounds.
 
         Args:
             boxes: np.ndarray (..., 4) with values in [0, 1].
             orig_w: Original image width in pixels.
             orig_h: Original image height in pixels.
             image_size: Model input square size used in preprocessing.
+            stretch: If True, image was stretched to square (scale by w/h).
+                     If False, aspect-preserving pad was used.
 
         Returns:
             np.ndarray (..., 4) in pixel coordinates [x1, y1, x2, y2].
         """
-        max_side = float(max(orig_w, orig_h))
-        scale_back = max_side / float(image_size)
-
-        cx = boxes[..., 0] * float(image_size) * scale_back
-        cy = boxes[..., 1] * float(image_size) * scale_back
-        w = boxes[..., 2] * float(image_size) * scale_back
-        h = boxes[..., 3] * float(image_size) * scale_back
+        if stretch:
+            # Upstream: boxes normalized to [0,1], scale directly by image dims
+            cx = boxes[..., 0] * float(orig_w)
+            cy = boxes[..., 1] * float(orig_h)
+            w = boxes[..., 2] * float(orig_w)
+            h = boxes[..., 3] * float(orig_h)
+        else:
+            # Pad mode: boxes in model-input space, undo padding scale
+            max_side = float(max(orig_w, orig_h))
+            scale_back = max_side / float(image_size)
+            cx = boxes[..., 0] * float(image_size) * scale_back
+            cy = boxes[..., 1] * float(image_size) * scale_back
+            w = boxes[..., 2] * float(image_size) * scale_back
+            h = boxes[..., 3] * float(image_size) * scale_back
 
         x1 = cx - w / 2.0
         y1 = cy - h / 2.0
@@ -925,19 +994,11 @@ class Sam3Node(Node):
         Decoder outputs (batch dimension = number of text prompts):
           - pred_masks: (batch, 200, 288, 288) float32
           - pred_boxes: (batch, 200, 4) float32, normalized [cx, cy, w, h]
-          - pred_logits: (batch, 200) float32 (raw logits, apply sigmoid)
-          - presence_logits: (batch, 1) float32
+          - pred_logits: (batch, 200, 1) or (batch, 200) float32 (raw logits)
+          - presence_logits: (batch, 1) float32 (per-text-prompt gate)
 
-        Args:
-            header: ROS message header.
-            orig_h, orig_w: Original image dimensions.
-            pred_masks, pred_boxes, pred_logits, presence_logits: Decoder outputs.
-            prompts: List of text prompt strings (snapshot from callback).
-            confidence_threshold: Threshold for filtering (snapshot).
-
-        Publishes:
-          - Detection2DArray on /sam3/detections
-          - Combined segmentation mask on /sam3/raw_segmentation_mask
+        Scoring: final = sigmoid(pred_logits) * sigmoid(presence_logits)
+        Matching upstream Sam3Processor._forward_grounding().
         """
         detection_array = Detection2DArray()
         detection_array.header = header
@@ -945,27 +1006,38 @@ class Sam3Node(Node):
         # Combined mask for all detections
         combined_mask = np.zeros((orig_h, orig_w), dtype=np.uint8)
 
-        # Convert logits to confidence scores via sigmoid
-        scores = 1.0 / (1.0 + np.exp(-pred_logits.astype(np.float64)))
+        # Convert logits to confidence scores via sigmoid.
+        # Following upstream: final_score = sigmoid(logit) * sigmoid(presence)
+        det_scores = 1.0 / (1.0 + np.exp(-pred_logits.astype(np.float64)))
         presence_scores = 1.0 / (
             1.0 + np.exp(-presence_logits.astype(np.float64)))
 
+        # Handle shape variations between PyTorch and Triton backends:
+        # PyTorch (forward_grounding): logits (B,200,1), presence (B,1)
+        # Triton (DecoderWrapper):     logits (B,200),   presence (B,1)
+        if det_scores.ndim == 3:
+            det_scores = det_scores.squeeze(-1)  # (B, 200, 1) -> (B, 200)
+        # presence (B, 1) broadcasts with det_scores (B, 200) -> (B, 200)
+        scores = det_scores * presence_scores
+
+        self.get_logger().debug(
+            f'Scores: max_det={float(det_scores.max()):.4f}, '
+            f'max_pres={float(presence_scores.max()):.4f}, '
+            f'max_final={float(scores.max()):.4f}, '
+            f'above_thresh={(scores > confidence_threshold).sum()}')
+
         # pred_masks, pred_boxes, scores shape: (batch, 200, ...)
-        # presence_scores shape: (batch, 1)
         num_batches = scores.shape[0] if scores.ndim >= 2 else 1
 
         for b in range(num_batches):
-            # Note: presence score is unreliable for distilled models
-            # (EfficientSAM3). Skip presence gating and rely on per-query
-            # detection scores instead.
             batch_scores = scores[b] if scores.ndim >= 2 else scores
             batch_boxes = pred_boxes[b] if pred_boxes.ndim >= 3 else pred_boxes
             batch_masks = pred_masks[b] if pred_masks.ndim >= 4 else pred_masks
 
             # Convert boxes from normalized [cx,cy,w,h] to original pixels
-            # by undoing preprocess scale (aspect-preserving + bottom-right pad).
             boxes_xyxy = self._cxcywh_to_xyxy(
-                batch_boxes, orig_w, orig_h, self._image_size)
+                batch_boxes, orig_w, orig_h, self._image_size,
+                self._stretch_resize)
 
             # Determine prompt label for this batch entry
             prompt_label = prompts[b] if b < len(prompts) else f'class_{b}'
@@ -1003,28 +1075,35 @@ class Sam3Node(Node):
 
                 detection_array.detections.append(det)
 
-                # Accumulate mask: decoder masks are predicted in square
-                # model-input coordinates. Crop out padded region first,
-                # then resize to original image size.
+                # Accumulate mask: decoder outputs (288, 288) logits.
+                # Following upstream: interpolate -> sigmoid -> threshold.
                 mask_data = batch_masks[j] if batch_masks.ndim >= 3 \
                     else batch_masks
-                binary_mask = (mask_data > 0).astype(np.uint8) * 255
 
-                # Recover preprocess geometry (top-left aligned padding).
-                scale = self._image_size / float(max(orig_h, orig_w))
-                valid_h = int(orig_h * scale)
-                valid_w = int(orig_w * scale)
-
-                mask_h, mask_w = binary_mask.shape[:2]
-                crop_h = int(round(valid_h * (mask_h / float(self._image_size))))
-                crop_w = int(round(valid_w * (mask_w / float(self._image_size))))
-                crop_h = max(1, min(mask_h, crop_h))
-                crop_w = max(1, min(mask_w, crop_w))
-
-                cropped_mask = binary_mask[:crop_h, :crop_w]
-                resized_mask = cv2.resize(
-                    cropped_mask, (orig_w, orig_h),
-                    interpolation=cv2.INTER_NEAREST)
+                if self._stretch_resize:
+                    # Stretch mode: bilinear upscale full mask to orig size,
+                    # apply sigmoid, then threshold at 0.5
+                    mask_float = mask_data.astype(np.float32)
+                    resized_logits = cv2.resize(
+                        mask_float, (orig_w, orig_h),
+                        interpolation=cv2.INTER_LINEAR)
+                    # sigmoid -> threshold
+                    resized_mask = (1.0 / (1.0 + np.exp(-resized_logits))
+                                    > 0.5).astype(np.uint8) * 255
+                else:
+                    # Pad mode: crop valid region, then resize
+                    binary_mask = (mask_data > 0).astype(np.uint8) * 255
+                    scale = self._image_size / float(max(orig_h, orig_w))
+                    valid_h = int(orig_h * scale)
+                    valid_w = int(orig_w * scale)
+                    mask_h, mask_w = binary_mask.shape[:2]
+                    crop_h = max(1, min(mask_h, int(round(
+                        valid_h * (mask_h / float(self._image_size))))))
+                    crop_w = max(1, min(mask_w, int(round(
+                        valid_w * (mask_w / float(self._image_size))))))
+                    resized_mask = cv2.resize(
+                        binary_mask[:crop_h, :crop_w], (orig_w, orig_h),
+                        interpolation=cv2.INTER_NEAREST)
 
                 # Each prompt gets a unique label value in the mask
                 label_value = min(
