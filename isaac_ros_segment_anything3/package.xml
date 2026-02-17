@@ -35,12 +35,14 @@ SPDX-License-Identifier: Apache-2.0
   <depend>std_msgs</depend>
   <depend>vision_msgs</depend>
   <depend>cv_bridge</depend>
+  <depend>message_filters</depend>
   <depend>isaac_ros_segment_anything3_interfaces</depend>
 
   <build_depend condition="$ROS_DISTRO == humble">isaac_ros_common</build_depend>
 
   <exec_depend>python3-opencv</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>foxglove_bridge</exec_depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

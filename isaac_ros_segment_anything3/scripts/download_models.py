@@ -425,6 +425,35 @@ def verify_only(model_repo_path, model_type='sam3'):
             print(f'  Generated: {config_path}')
 
 
+def download_demo_video(model_repo_path, url_or_default='default'):
+    """Download a sample demo video for Foxglove demos."""
+    dest = os.path.join(model_repo_path, 'demo.mp4')
+    if os.path.isfile(dest):
+        print(f'Demo video already exists: {dest}')
+        return dest
+
+    if url_or_default == 'default':
+        print('No demo video URL provided.')
+        print(f'Please download a sample video and save to: {dest}')
+        print('Suggested sources (free, no attribution required):')
+        print('  - https://pixabay.com/videos/search/people%20walking/')
+        print('  - https://www.pexels.com/search/videos/people%20walking/')
+        print('')
+        print('Or provide a direct URL:')
+        print('  python3 download_models.py --demo-video <URL>')
+        return dest
+
+    os.makedirs(model_repo_path, exist_ok=True)
+    print(f'Downloading demo video from {url_or_default} ...')
+    try:
+        download_file(url_or_default, dest)
+        print(f'Demo video saved: {dest}')
+    except Exception as e:
+        print(f'Failed to download demo video: {e}')
+        print(f'Manually place a video at: {dest}')
+    return dest
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Download SAM3/EfficientSAM3 models '
@@ -450,7 +479,14 @@ def main():
     parser.add_argument(
         '--verify-only', action='store_true',
         help='Only verify existing ONNX models and regenerate configs')
+    parser.add_argument(
+        '--demo-video', default=None, nargs='?', const='default',
+        help='Download a sample demo video to MODEL_REPO/demo.mp4. '
+             'Optionally provide a direct URL to a specific mp4 file.')
     args = parser.parse_args()
+
+    if args.demo_video is not None:
+        download_demo_video(args.model_repo, args.demo_video)
 
     if args.verify_only:
         verify_only(args.model_repo, args.model_type)

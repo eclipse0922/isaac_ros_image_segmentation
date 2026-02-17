@@ -28,18 +28,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ros-${ROS_DISTRO}-ros-base \
         ros-${ROS_DISTRO}-cv-bridge \
         ros-${ROS_DISTRO}-vision-msgs \
-        python3-colcon-common-extensions && \
+        ros-${ROS_DISTRO}-foxglove-bridge \
+        python3-colcon-common-extensions \
+        python3-opencv \
+        ffmpeg libavcodec-dev libavformat-dev libswscale-dev && \
     rm -rf /var/lib/apt/lists/*
 
 # ---- Python dependencies ----
+# Remove NGC's bundled OpenCV (no FFMPEG) to use system python3-opencv (has FFMPEG)
+RUN pip uninstall -y opencv-python opencv-python-headless opencv-contrib-python 2>/dev/null; true && \
+    rm -rf /usr/local/lib/python3.12/dist-packages/cv2*
 # numpy<2 required for cv_bridge compatibility
+# EfficientSAM3 pip package installs module `sam3` used by sam3_node.py.
 RUN pip install --no-cache-dir \
         "numpy<2" \
         tokenizers \
-        opencv-python-headless \
         einops \
         timm \
-        open_clip_torch
+        open_clip_torch \
+        git+https://github.com/SimonZeng7108/efficientsam3.git@77e830355cb164b6bfe18d1f1f3f35d04ef73e70
+
+# EfficientSAM3 expects this asset path inside sam3 package.
+RUN mkdir -p /usr/local/lib/python3.12/dist-packages/sam3/assets && \
+    cp /usr/local/lib/python3.12/dist-packages/open_clip/bpe_simple_vocab_16e6.txt.gz \
+      /usr/local/lib/python3.12/dist-packages/sam3/assets/bpe_simple_vocab_16e6.txt.gz
 
 # ---- Source ROS2 by default ----
 RUN echo "source /opt/ros/${ROS_DISTRO}/setup.bash" >> /etc/bash.bashrc

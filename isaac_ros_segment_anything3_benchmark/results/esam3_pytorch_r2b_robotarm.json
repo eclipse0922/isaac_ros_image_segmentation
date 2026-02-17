@@ -1,0 +1,53 @@
+{
+  "benchmark_metadata": {
+    "name": "Isaac ROS SAM3 Graph Benchmark",
+    "test_datetime": "2026-02-17T04:03:30.406548",
+    "test_duration_sec": 30.0,
+    "warmup_frames": 10,
+    "config": {
+      "model_type": "efficient_sam3",
+      "backend": "pytorch",
+      "num_prompts": 1
+    }
+  },
+  "performance_metrics": {
+    "num_frames": 174,
+    "throughput_fps": 6.1071402946999855,
+    "latency_ms": {
+      "mean": 108.02316735632418,
+      "std_dev": 7.910111131347659,
+      "min": 91.60977600004117,
+      "max": 141.21690899992245,
+      "p50": 108.47474599995621,
+      "p95": 118.76471550049246,
+      "p99": 130.5544786103565
+    },
+    "stage_breakdown_ms": {
+      "cvbridge": {
+        "mean": 0.935098086218246,
+        "std_dev": 0.1522837242862281
+      },
+      "preprocess": {
+        "mean": 11.082112028753759,
+        "std_dev": 1.9516364454472044
+      },
+      "vision_encoder": {
+        "mean": 11.501823775824437,
+        "std_dev": 1.726309066691733
+      },
+      "text_encoder": {
+        "mean": 0.00041137354855891317,
+        "std_dev": 0.00017435850936696424,
+        "cache_hit_rate": 1.0
+      },
+      "decoder": {
+        "mean": 75.33054875867315,
+        "std_dev": 6.11891023952036
+      },
+      "postprocess": {
+        "mean": 9.173173333306034,
+        "std_dev": 3.213218423986208
+      }
+    }
+  }
+}

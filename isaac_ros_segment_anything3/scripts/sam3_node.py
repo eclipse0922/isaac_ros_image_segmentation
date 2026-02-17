@@ -955,14 +955,9 @@ class Sam3Node(Node):
         num_batches = scores.shape[0] if scores.ndim >= 2 else 1
 
         for b in range(num_batches):
-            # Check presence: skip this batch entry if presence is low
-            batch_presence = float(
-                presence_scores[b, 0]
-                if presence_scores.ndim >= 2
-                else presence_scores[b])
-            if batch_presence < confidence_threshold:
-                continue
-
+            # Note: presence score is unreliable for distilled models
+            # (EfficientSAM3). Skip presence gating and rely on per-query
+            # detection scores instead.
             batch_scores = scores[b] if scores.ndim >= 2 else scores
             batch_boxes = pred_boxes[b] if pred_boxes.ndim >= 3 else pred_boxes
             batch_masks = pred_masks[b] if pred_masks.ndim >= 4 else pred_masks
@@ -1059,11 +1054,14 @@ def main(args=None):
 
     try:
         executor.spin()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, Exception):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':

@@ -84,14 +84,91 @@ Three ONNX models from [jamjamjon/assets](https://github.com/jamjamjon/assets/re
 
 Use `scripts/download_models.py` to download and auto-verify.
 
-## Development Setup
+## Docker PyTorch Demo Setup (Recommended)
+
+Use this flow for MP4/rosbag + Foxglove demos with
+`model_type:=efficient_sam3` and `inference_backend:=pytorch`.
+
+Required model files:
+- `/tmp/models/efficient_sam3.pth`
+- `/tmp/models/tokenizer.json`
+
+```bash
+# Build demo image
+docker build -f isaac_ros_segment_anything3/docker/Dockerfile.pytorch \
+  -t sam3_pytorch:latest .
+
+# Build workspace in container
+docker run --rm -it --gpus all --ipc=host \
+  -v /media/sewon/Dev/isaac_ros_image_segmentation:/ws \
+  -v /tmp:/tmp \
+  -w /ws \
+  sam3_pytorch:latest \
+  bash -lc 'source /opt/ros/jazzy/setup.bash && \
+            colcon build --packages-select \
+              isaac_ros_segment_anything3_interfaces \
+              isaac_ros_segment_anything3'
+
+# Optional import smoke test
+python3 -c "import sam3, cv2, message_filters, tokenizers; print(\"ok\")"
+```
+
+### Download Real Camera Footage (Non-synthetic)
+
+```bash
+mkdir -p /tmp/models
+
+# Real-world MP4 clip (street/driving footage)
+curl -L --fail -o /tmp/models/demo_real.mp4 \
+  https://download.samplelib.com/mp4/sample-5s.mp4
+
+# Optional: real CCTV-style sample video (AVI)
+curl -L --fail -o /tmp/models/vtest.avi \
+  https://raw.githubusercontent.com/opencv/opencv/master/samples/data/vtest.avi
+```
+
+### Unified Demo Launch (MP4)
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source /ws/install/setup.bash
+
+ros2 launch isaac_ros_segment_anything3 isaac_ros_segment_anything3_demo.launch.py \
+  input_type:=video \
+  input_path:=/tmp/models/demo_real.mp4 \
+  model_type:=efficient_sam3 \
+  inference_backend:=pytorch \
+  model_repository_path:=/tmp/models \
+  tokenizer_path:=/tmp/models/tokenizer.json \
+  input_image_topic:=image_raw
+```
+
+### Unified Demo Launch (rosbag)
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source /ws/install/setup.bash
+
+ros2 launch isaac_ros_segment_anything3 isaac_ros_segment_anything3_demo.launch.py \
+  input_type:=bag \
+  input_path:=<rosbag_path> \
+  input_image_topic:=<bag_image_topic> \
+  model_type:=efficient_sam3 \
+  inference_backend:=pytorch \
+  model_repository_path:=/tmp/models \
+  tokenizer_path:=/tmp/models/tokenizer.json
+```
+
+Connect Foxglove Studio to `ws://localhost:8765`.
+
+## Triton Development Setup (Optional)
 
 ```bash
 # Install Python dependencies
 pip install tritonclient[all] onnxruntime opencv-python-headless tokenizers numpy
 
 # Download models
-python3 scripts/download_models.py --output /tmp/sam3_models
+python3 scripts/download_models.py --model-type sam3 --model-repo /tmp/sam3_models
 
 # Start Triton server
 docker run --rm --gpus all -p 8001:8001 \
