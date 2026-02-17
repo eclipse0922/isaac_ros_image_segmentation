@@ -85,7 +85,7 @@ class IsaacROSSegmentAnything3LaunchFragment(IsaacROSLaunchFragment):
                 description='Confidence threshold for SAM3 detections'),
             'sam3_image_size': DeclareLaunchArgument(
                 'sam3_image_size',
-                default_value='1024',
+                default_value='1008',
                 description='SAM3 model input image size'),
             'sam3_inference_backend': DeclareLaunchArgument(
                 'sam3_inference_backend',

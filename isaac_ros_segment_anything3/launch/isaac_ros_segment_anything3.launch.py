@@ -82,7 +82,7 @@ def generate_launch_description():
 
     image_size_arg = DeclareLaunchArgument(
         'image_size',
-        default_value='1024',
+        default_value='1008',
         description='Model input image size')
 
     confidence_threshold_arg = DeclareLaunchArgument(

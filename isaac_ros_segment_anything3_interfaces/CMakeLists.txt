@@ -34,6 +34,7 @@ ament_auto_find_build_dependencies()
 find_package(rosidl_default_generators REQUIRED)
 
 set(MSG_FILES
+  "msg/Sam3Timing.msg"
 )
 set(SRV_FILES
   "srv/SetTextPrompt.srv"

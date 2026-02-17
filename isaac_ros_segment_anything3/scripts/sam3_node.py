@@ -64,6 +64,7 @@ from vision_msgs.msg import (
     ObjectHypothesisWithPose,
 )
 
+from isaac_ros_segment_anything3_interfaces.msg import Sam3Timing
 from isaac_ros_segment_anything3_interfaces.srv import SetTextPrompt
 
 _MAX_PROMPTS = 3
@@ -209,6 +210,8 @@ class Sam3Node(Node):
             Image, 'sam3/raw_segmentation_mask', 10)
         self._detection_pub = self.create_publisher(
             Detection2DArray, 'sam3/detections', 10)
+        self._timing_pub = self.create_publisher(
+            Sam3Timing, 'sam3/timing', 10)
 
         # Service: set text prompt
         self._set_prompt_srv = self.create_service(
@@ -768,6 +771,9 @@ class Sam3Node(Node):
         _t_vision = _time.perf_counter()
 
         # 3. Text encoder (cached until prompt changes)
+        _t_text_start = _time.perf_counter()
+        text_cache_hit = (text_cache is not None)
+
         if text_cache is not None:
             text_features, text_mask = text_cache
         else:
@@ -787,6 +793,8 @@ class Sam3Node(Node):
                 # Only update if prompts haven't changed meanwhile
                 if self._current_prompts == current_prompts:
                     self._text_features_cache = (text_features, text_mask)
+
+        _t_text_end = _time.perf_counter()
 
         # 4. Decoder: run per-prompt (batch=1).
         all_masks = []
@@ -836,39 +844,76 @@ class Sam3Node(Node):
             current_prompts, confidence_threshold)
         _t_end = _time.perf_counter()
 
+        # Create and publish timing message
+        timing_msg = Sam3Timing()
+        timing_msg.header.stamp = self.get_clock().now().to_msg()
+        timing_msg.cvbridge_ms = (_t_cvbridge - _t_start) * 1000.0
+        timing_msg.preprocess_ms = (_t_preproc - _t_cvbridge) * 1000.0
+        timing_msg.vision_encoder_ms = (_t_vision - _t_preproc) * 1000.0
+        timing_msg.text_encoder_ms = (_t_text_end - _t_text_start) * 1000.0
+        timing_msg.text_encoder_cache_hit = text_cache_hit
+        # Decoder timing excludes text encoder time
+        timing_msg.decoder_ms = (
+            _t_decoder - _t_vision - (_t_text_end - _t_text_start)) * 1000.0
+        timing_msg.num_prompts = num_prompts
+        timing_msg.postprocess_ms = (_t_end - _t_decoder) * 1000.0
+        timing_msg.total_ms = (_t_end - _t_start) * 1000.0
+        timing_msg.backend = self._backend
+        timing_msg.model_type = self._model_type
+
+        self._timing_pub.publish(timing_msg)
+
+        # Keep existing log for convenience
         self.get_logger().info(
-            f'Timing: cvbridge={(_t_cvbridge-_t_start)*1000:.1f}ms '
-            f'preproc={(_t_preproc-_t_cvbridge)*1000:.1f}ms '
-            f'vision={(_t_vision-_t_preproc)*1000:.1f}ms '
-            f'decoder={(_t_decoder-_t_vision)*1000:.1f}ms '
-            f'postproc={(_t_end-_t_decoder)*1000:.1f}ms '
-            f'total={(_t_end-_t_start)*1000:.1f}ms')
+            f'Timing: cvbridge={timing_msg.cvbridge_ms:.1f}ms '
+            f'preproc={timing_msg.preprocess_ms:.1f}ms '
+            f'vision={timing_msg.vision_encoder_ms:.1f}ms '
+            f'text={timing_msg.text_encoder_ms:.1f}ms(cache={text_cache_hit}) '
+            f'decoder={timing_msg.decoder_ms:.1f}ms '
+            f'postproc={timing_msg.postprocess_ms:.1f}ms '
+            f'total={timing_msg.total_ms:.1f}ms')
 
     # ----------------------------------------------------------------
     # Output publishing
     # ----------------------------------------------------------------
 
     @staticmethod
-    def _cxcywh_to_xyxy(boxes, img_w, img_h):
+    def _cxcywh_to_xyxy(boxes, orig_w, orig_h, image_size):
         """
         Convert normalized [cx, cy, w, h] boxes to pixel [x1, y1, x2, y2].
 
+        Boxes are normalized against the square model input
+        (image_size x image_size) after top-left aligned padding.
+        To map back to original image coordinates, invert the same scale used
+        by preprocessing and then clip to original bounds.
+
         Args:
             boxes: np.ndarray (..., 4) with values in [0, 1].
-            img_w: Original image width in pixels.
-            img_h: Original image height in pixels.
+            orig_w: Original image width in pixels.
+            orig_h: Original image height in pixels.
+            image_size: Model input square size used in preprocessing.
 
         Returns:
             np.ndarray (..., 4) in pixel coordinates [x1, y1, x2, y2].
         """
-        cx = boxes[..., 0] * img_w
-        cy = boxes[..., 1] * img_h
-        w = boxes[..., 2] * img_w
-        h = boxes[..., 3] * img_h
+        max_side = float(max(orig_w, orig_h))
+        scale_back = max_side / float(image_size)
+
+        cx = boxes[..., 0] * float(image_size) * scale_back
+        cy = boxes[..., 1] * float(image_size) * scale_back
+        w = boxes[..., 2] * float(image_size) * scale_back
+        h = boxes[..., 3] * float(image_size) * scale_back
+
         x1 = cx - w / 2.0
         y1 = cy - h / 2.0
         x2 = cx + w / 2.0
         y2 = cy + h / 2.0
+
+        x1 = np.clip(x1, 0.0, float(orig_w))
+        y1 = np.clip(y1, 0.0, float(orig_h))
+        x2 = np.clip(x2, 0.0, float(orig_w))
+        y2 = np.clip(y2, 0.0, float(orig_h))
+
         return np.stack([x1, y1, x2, y2], axis=-1)
 
     def _publish_results(self, header, orig_h, orig_w,
@@ -922,8 +967,10 @@ class Sam3Node(Node):
             batch_boxes = pred_boxes[b] if pred_boxes.ndim >= 3 else pred_boxes
             batch_masks = pred_masks[b] if pred_masks.ndim >= 4 else pred_masks
 
-            # Convert boxes from normalized [cx,cy,w,h] to pixel [x1,y1,x2,y2]
-            boxes_xyxy = self._cxcywh_to_xyxy(batch_boxes, orig_w, orig_h)
+            # Convert boxes from normalized [cx,cy,w,h] to original pixels
+            # by undoing preprocess scale (aspect-preserving + bottom-right pad).
+            boxes_xyxy = self._cxcywh_to_xyxy(
+                batch_boxes, orig_w, orig_h, self._image_size)
 
             # Determine prompt label for this batch entry
             prompt_label = prompts[b] if b < len(prompts) else f'class_{b}'
@@ -946,6 +993,8 @@ class Sam3Node(Node):
                 box = boxes_xyxy[j]
                 x1, y1, x2, y2 = float(box[0]), float(box[1]), \
                     float(box[2]), float(box[3])
+                if (x2 - x1) <= 0.0 or (y2 - y1) <= 0.0:
+                    continue
                 det.bbox.center.position.x = (x1 + x2) / 2.0
                 det.bbox.center.position.y = (y1 + y2) / 2.0
                 det.bbox.size_x = x2 - x1
@@ -959,12 +1008,27 @@ class Sam3Node(Node):
 
                 detection_array.detections.append(det)
 
-                # Accumulate mask: masks are 288x288, resize to original
+                # Accumulate mask: decoder masks are predicted in square
+                # model-input coordinates. Crop out padded region first,
+                # then resize to original image size.
                 mask_data = batch_masks[j] if batch_masks.ndim >= 3 \
                     else batch_masks
                 binary_mask = (mask_data > 0).astype(np.uint8) * 255
+
+                # Recover preprocess geometry (top-left aligned padding).
+                scale = self._image_size / float(max(orig_h, orig_w))
+                valid_h = int(orig_h * scale)
+                valid_w = int(orig_w * scale)
+
+                mask_h, mask_w = binary_mask.shape[:2]
+                crop_h = int(round(valid_h * (mask_h / float(self._image_size))))
+                crop_w = int(round(valid_w * (mask_w / float(self._image_size))))
+                crop_h = max(1, min(mask_h, crop_h))
+                crop_w = max(1, min(mask_w, crop_w))
+
+                cropped_mask = binary_mask[:crop_h, :crop_w]
                 resized_mask = cv2.resize(
-                    binary_mask, (orig_w, orig_h),
+                    cropped_mask, (orig_w, orig_h),
                     interpolation=cv2.INTER_NEAREST)
 
                 # Each prompt gets a unique label value in the mask

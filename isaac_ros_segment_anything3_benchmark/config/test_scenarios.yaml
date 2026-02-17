@@ -1,0 +1,98 @@
+# SAM3 Benchmark Test Scenarios Configuration
+#
+# This file defines standard benchmark scenarios for SAM3/EfficientSAM3 performance testing.
+# Each scenario specifies model type, backend, prompts, and expected performance characteristics.
+
+scenarios:
+  # Single Prompt - PyTorch Backend (Default)
+  - name: "single_prompt_pytorch"
+    backend: "pytorch"
+    model_type: "efficient_sam3"
+    text_prompts: ["person"]
+    expected_latency_ms: 131
+    description: "Baseline benchmark with PyTorch backend and 1 prompt"
+
+  # Single Prompt - Triton Backend (Comparison)
+  - name: "single_prompt_triton"
+    backend: "triton"
+    model_type: "efficient_sam3"
+    text_prompts: ["person"]
+    expected_latency_ms: 849
+    description: "Triton ONNX backend comparison (slower but more portable)"
+
+  # Multi-Prompt Scaling Tests (PyTorch)
+  - name: "two_prompts_pytorch"
+    backend: "pytorch"
+    model_type: "efficient_sam3"
+    text_prompts: ["person", "car"]
+    expected_latency_ms: 192
+    description: "Two prompts - decoder runs 2x (batch=1 constraint)"
+
+  - name: "three_prompts_pytorch"
+    backend: "pytorch"
+    model_type: "efficient_sam3"
+    text_prompts: ["person", "car", "sky"]
+    expected_latency_ms: 263
+    description: "Three prompts - decoder runs 3x (batch=1 constraint)"
+
+  # Model Comparison (SAM3 vs EfficientSAM3)
+  - name: "sam3_vs_efficient_pytorch"
+    variants:
+      - model_type: "sam3"
+        expected_latency_ms: 145
+      - model_type: "efficient_sam3"
+        expected_latency_ms: 131
+    backend: "pytorch"
+    text_prompts: ["person"]
+    description: "Compare full SAM3 vs distilled EfficientSAM3"
+
+  # Cache Effectiveness Test
+  - name: "static_prompt_cache_test"
+    backend: "pytorch"
+    model_type: "efficient_sam3"
+    text_prompts: ["person"]  # Same prompt throughout test
+    expected_cache_hit_rate: 0.97
+    description: "Verify text encoder cache hit rate with static prompt"
+
+# Dataset Configurations
+datasets:
+  sam3_test_288p:
+    resolution: "512x288"
+    fps: 30
+    duration_sec: 30
+    description: "Low resolution for high throughput testing"
+
+  sam3_test_720p:
+    resolution: "1280x720"
+    fps: 30
+    duration_sec: 30
+    description: "Standard HD benchmark dataset"
+
+  sam3_test_1080p:
+    resolution: "1920x1080"
+    fps: 30
+    duration_sec: 30
+    description: "Full HD stress test"
+
+# Performance Expectations (RTX 4090)
+expected_performance:
+  efficient_sam3_pytorch:
+    vision_encoder_ms: 19.8
+    text_encoder_ms: 2.3  # First call (then cached)
+    decoder_ms_per_prompt: 70.4
+    cvbridge_ms: 2.1
+    preprocess_ms: 1.8
+    postprocess_ms: 37.3
+    total_ms_1prompt: 131
+
+  efficient_sam3_triton:
+    vision_encoder_ms: 322
+    text_encoder_ms: 2.2
+    decoder_ms_per_prompt: 536
+    total_ms_1prompt: 849
+
+  sam3_pytorch:
+    vision_encoder_ms: 571
+    text_encoder_ms: 5.9
+    decoder_ms_per_prompt: 564
+    total_ms_1prompt: 1123
