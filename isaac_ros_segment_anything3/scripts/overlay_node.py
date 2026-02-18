@@ -66,12 +66,15 @@ class OverlayNode(Node):
         # Publisher
         self._pub = self.create_publisher(Image, 'sam3/overlay', 10)
 
-        # Synchronized subscribers
-        qos = QoSProfile(depth=5, reliability=ReliabilityPolicy.RELIABLE)
+        # Synchronized subscribers.
+        # image_raw uses BEST_EFFORT to match bag players and camera drivers.
+        # raw_segmentation_mask is published RELIABLE by sam3_node.
+        image_qos = QoSProfile(depth=5, reliability=ReliabilityPolicy.BEST_EFFORT)
+        mask_qos = QoSProfile(depth=5, reliability=ReliabilityPolicy.RELIABLE)
         image_sub = message_filters.Subscriber(
-            self, Image, 'image_raw', qos_profile=qos)
+            self, Image, 'image_raw', qos_profile=image_qos)
         mask_sub = message_filters.Subscriber(
-            self, Image, 'sam3/raw_segmentation_mask', qos_profile=qos)
+            self, Image, 'sam3/raw_segmentation_mask', qos_profile=mask_qos)
 
         self._sync = message_filters.ApproximateTimeSynchronizer(
             [image_sub, mask_sub], queue_size=5, slop=0.5)

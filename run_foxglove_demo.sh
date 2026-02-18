@@ -81,13 +81,22 @@ if [ ! -f "$CHECKPOINT_PATH" ]; then
     exit 1
 fi
 
-# Convert relative path to absolute
+# Convert host path to Docker-internal path.
+# The workspace is mounted at /ws inside the container.
+# Any path under WORKSPACE_DIR is rewritten to /ws/...
+# Any other absolute path is passed through (must be mounted separately).
 INPUT_PATH="$(realpath "$INPUT_PATH" 2>/dev/null || echo "$INPUT_PATH")"
+if [[ "$INPUT_PATH" == "$WORKSPACE_DIR"* ]]; then
+    DOCKER_INPUT_PATH="/ws${INPUT_PATH#$WORKSPACE_DIR}"
+else
+    DOCKER_INPUT_PATH="$INPUT_PATH"
+    echo "Warning: $INPUT_PATH is outside workspace — make sure it's accessible inside Docker"
+fi
 
 echo "=========================================="
 echo "SAM3 Foxglove Demo"
 echo "=========================================="
-echo "  Input: $INPUT_TYPE → $INPUT_PATH"
+echo "  Input: $INPUT_TYPE → $INPUT_PATH (→ $DOCKER_INPUT_PATH in container)"
 echo "  Topic: $IMAGE_TOPIC"
 echo "  Prompt: $TEXT_PROMPT"
 echo "  Foxglove port: $FOXGLOVE_PORT"
@@ -119,10 +128,10 @@ docker run --rm --runtime=nvidia \
         source /ws/install/setup.bash 2>/dev/null || true
 
         # Sync latest scripts
-        cp /ws/isaac_ros_segment_anything3/scripts/sam3_node.py \
-           /ws/install/isaac_ros_segment_anything3/lib/isaac_ros_segment_anything3/sam3_node.py 2>/dev/null || true
-        cp /ws/isaac_ros_segment_anything3/scripts/overlay_node.py \
-           /ws/install/isaac_ros_segment_anything3/lib/isaac_ros_segment_anything3/overlay_node.py 2>/dev/null || true
+        for _script in sam3_node.py overlay_node.py video_publisher.py; do
+            cp /ws/isaac_ros_segment_anything3/scripts/\$_script \
+               /ws/install/isaac_ros_segment_anything3/lib/isaac_ros_segment_anything3/\$_script 2>/dev/null || true
+        done
 
         echo '[demo] Starting SAM3 node...'
         ros2 run isaac_ros_segment_anything3 sam3_node.py \
@@ -177,19 +186,19 @@ docker run --rm --runtime=nvidia \
             isaac_ros_segment_anything3_interfaces/srv/SetTextPrompt \
             \"{text_prompts: ['$TEXT_PROMPT']}\" || true
 
-        # Start input source
+        # Start input source (use Docker-internal path)
         if [ '$INPUT_TYPE' = 'video' ]; then
-            echo \"[demo] Starting video publisher: $INPUT_PATH\"
+            echo \"[demo] Starting video publisher: $DOCKER_INPUT_PATH\"
             ros2 run isaac_ros_segment_anything3 video_publisher.py \
                 --ros-args \
-                -p video_path:=$INPUT_PATH \
+                -p video_path:=$DOCKER_INPUT_PATH \
                 -p fps:=10.0 \
                 -p loop:=True \
                 --remap image_raw:=$IMAGE_TOPIC &
             INPUT_PID=\$!
         else
-            echo \"[demo] Starting bag playback: $INPUT_PATH\"
-            ros2 bag play '$INPUT_PATH' --loop &
+            echo \"[demo] Starting bag playback: $DOCKER_INPUT_PATH\"
+            ros2 bag play '$DOCKER_INPUT_PATH' --loop &
             INPUT_PID=\$!
         fi
 

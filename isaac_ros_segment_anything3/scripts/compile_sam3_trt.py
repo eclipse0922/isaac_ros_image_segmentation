@@ -68,7 +68,7 @@ def main():
     parser.add_argument('--checkpoint', required=True, help='Path to model checkpoint')
     parser.add_argument('--model-type', default='sam3', choices=['sam3'])
     parser.add_argument('--output', default=None, help='Output path for compiled engine')
-    parser.add_argument('--precision', default='fp16', choices=['fp16', 'fp32'])
+    parser.add_argument('--precision', default='fp16', choices=['fp16', 'fp32', 'bf16'])
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--benchmark-only', action='store_true',
                         help='Skip compilation, just benchmark PyTorch baseline')
@@ -148,7 +148,12 @@ def main():
     print('  This takes 1-3 minutes...')
 
     import torch_tensorrt
-    enabled_precisions = {torch.float16} if args.precision == 'fp16' else {torch.float32}
+    precision_map = {
+        'fp16': {torch.float16},
+        'bf16': {torch.bfloat16},
+        'fp32': {torch.float32},
+    }
+    enabled_precisions = precision_map[args.precision]
 
     t0 = time.perf_counter()
     trt_model = torch_tensorrt.dynamo.compile(
