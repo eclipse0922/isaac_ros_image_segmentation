@@ -41,6 +41,9 @@ def main():
                         help='Number of warmup runs before timed inference')
     parser.add_argument('--n-runs', type=int, default=1,
                         help='Number of timed runs (reports average)')
+    parser.add_argument('--precision', default='fp32',
+                        choices=['fp32', 'fp16', 'bf16'],
+                        help='Inference precision (wraps pipeline in autocast)')
     args = parser.parse_args()
 
     import torch
@@ -107,9 +110,19 @@ def main():
     # Run inference
     device = args.device
 
+    # Set up autocast context for precision mode
+    import contextlib
+    if args.precision == 'bf16':
+        amp_ctx = torch.autocast('cuda', dtype=torch.bfloat16)
+    elif args.precision == 'fp16':
+        amp_ctx = torch.autocast('cuda', dtype=torch.float16)
+    else:
+        amp_ctx = contextlib.nullcontext()
+    print(f'Precision: {args.precision}')
+
     def run_once():
         """Single forward pass, returns (all_results, t_vision, t_text, t_decoder)."""
-        with torch.inference_mode():
+        with torch.inference_mode(), amp_ctx:
             t1 = time.perf_counter()
             backbone_out = model.backbone.forward_image(img_tensor)
             torch.cuda.synchronize()
