@@ -10,3 +10,6 @@ third_party/
 
 # Test results
 test_results/
+
+# Model checkpoints (large binary files)
+models/
