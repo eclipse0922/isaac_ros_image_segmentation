@@ -16,19 +16,30 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Unified Foxglove demo launch for EfficientSAM3 text-prompted segmentation.
+Foxglove demo launch for SAM3 text-prompted segmentation.
 
-Supports both MP4 video files and rosbag files as input.
+Supports MP4 video files and rosbag files as input.
 Connect Foxglove Studio to ws://localhost:<foxglove_port> to visualize.
 
+Pipeline:
+  video/bag -> sam3_node (PyTorch + TRT) -> overlay_node -> foxglove_bridge
+
 Usage:
-    # Video input (default)
-    ros2 launch isaac_ros_segment_anything3 isaac_ros_segment_anything3_demo.launch.py \
-        input_type:=video input_path:=/path/to/video.mp4
+    # Video input
+    ros2 launch isaac_ros_segment_anything3 isaac_ros_segment_anything3_demo.launch.py \\
+        input_type:=video input_path:=/path/to/video.mp4 \\
+        pytorch_checkpoint:=/ws/models/sam3/sam3.pt
 
     # Rosbag input
-    ros2 launch isaac_ros_segment_anything3 isaac_ros_segment_anything3_demo.launch.py \
-        input_type:=bag input_path:=/path/to/bag_folder
+    ros2 launch isaac_ros_segment_anything3 isaac_ros_segment_anything3_demo.launch.py \\
+        input_type:=bag input_path:=/path/to/bag_folder \\
+        input_image_topic:=camera/color/image_raw \\
+        pytorch_checkpoint:=/ws/models/sam3/sam3.pt
+
+    # Change text prompt after launch (~90s for model to load + torch.compile):
+    ros2 service call /sam3/set_text_prompt \\
+        isaac_ros_segment_anything3_interfaces/srv/SetTextPrompt \\
+        "{text_prompts: ['robot arm']}"
 """
 
 from launch import LaunchDescription
@@ -44,52 +55,54 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description():
-    # --- Launch arguments ---
+    # --- Launch arguments: input source ---
     input_type_arg = DeclareLaunchArgument(
         'input_type', default_value='video',
         description="Input type: 'video' (mp4) or 'bag' (rosbag)")
 
     input_path_arg = DeclareLaunchArgument(
         'input_path',
-        description='Path to the input video file (mp4) or rosbag folder')
+        description='Path to input video file (mp4) or rosbag folder')
 
     input_image_topic_arg = DeclareLaunchArgument(
         'input_image_topic', default_value='image_raw',
-        description='Input image topic for SAM3/overlay (for bag use this '
-                    'to match the bag image topic)')
+        description='Image topic name (match rosbag topic for bag input)')
 
     fps_arg = DeclareLaunchArgument(
         'fps', default_value='30.0',
-        description='Video publishing rate in Hz (only for input_type:=video)')
+        description='Video publishing rate in Hz (video input only)')
 
     loop_arg = DeclareLaunchArgument(
         'loop', default_value='True',
         description='Loop video or bag file')
 
+    # --- Launch arguments: model ---
+    pytorch_checkpoint_arg = DeclareLaunchArgument(
+        'pytorch_checkpoint', default_value='/tmp/models/sam3.pt',
+        description='Path to SAM3 checkpoint (sam3.pt, ~3.3GB)')
+
+    pytorch_device_arg = DeclareLaunchArgument(
+        'pytorch_device', default_value='cuda',
+        description='PyTorch device (cuda or cpu)')
+
+    pytorch_compile_decoder_arg = DeclareLaunchArgument(
+        'pytorch_compile_decoder', default_value='True',
+        description='Apply torch.compile to decoder (~30s startup, ~3x faster)')
+
+    pytorch_amp_decoder_arg = DeclareLaunchArgument(
+        'pytorch_amp_decoder', default_value='True',
+        description='Use AMP FP16 for decoder (with torch.compile)')
+
+    # --- Launch arguments: inference ---
     text_prompt_arg = DeclareLaunchArgument(
-        'text_prompt', default_value='sky',
+        'text_prompt', default_value='person',
         description='Initial text prompt (comma-separated for multiple)')
-
-    model_type_arg = DeclareLaunchArgument(
-        'model_type', default_value='efficient_sam3',
-        description='Model type: sam3 or efficient_sam3')
-
-    inference_backend_arg = DeclareLaunchArgument(
-        'inference_backend', default_value='pytorch',
-        description='Inference backend: triton or pytorch')
-
-    model_repository_path_arg = DeclareLaunchArgument(
-        'model_repository_path', default_value='/tmp/models',
-        description='Path to model repository')
-
-    tokenizer_path_arg = DeclareLaunchArgument(
-        'tokenizer_path', default_value='/tmp/models/tokenizer.json',
-        description='Path to tokenizer.json')
 
     confidence_threshold_arg = DeclareLaunchArgument(
         'confidence_threshold', default_value='0.3',
         description='Detection confidence threshold')
 
+    # --- Launch arguments: visualization ---
     foxglove_port_arg = DeclareLaunchArgument(
         'foxglove_port', default_value='8765',
         description='Foxglove bridge WebSocket port')
@@ -98,7 +111,7 @@ def generate_launch_description():
         'overlay_alpha', default_value='0.45',
         description='Overlay mask opacity (0.0-1.0)')
 
-    # --- Derived configurations ---
+    # --- Derived conditions ---
     is_video = PythonExpression(
         ["'", LaunchConfiguration('input_type'), "' == 'video'"])
     is_bag_loop = PythonExpression(
@@ -148,19 +161,18 @@ def generate_launch_description():
         output='screen',
     )
 
-    # --- Segmentation pipeline ---
+    # --- SAM3 segmentation node (PyTorch + TRT) ---
     sam3_node = Node(
         package='isaac_ros_segment_anything3',
         executable='sam3_node.py',
         name='sam3_node',
         parameters=[{
-            'model_type': LaunchConfiguration('model_type'),
-            'inference_backend': LaunchConfiguration('inference_backend'),
-            'model_repository_path':
-                LaunchConfiguration('model_repository_path'),
-            'tokenizer_path': LaunchConfiguration('tokenizer_path'),
-            'confidence_threshold':
-                LaunchConfiguration('confidence_threshold'),
+            'pytorch_checkpoint': LaunchConfiguration('pytorch_checkpoint'),
+            'pytorch_device': LaunchConfiguration('pytorch_device'),
+            'pytorch_compile_decoder':
+                LaunchConfiguration('pytorch_compile_decoder'),
+            'pytorch_amp_decoder': LaunchConfiguration('pytorch_amp_decoder'),
+            'confidence_threshold': LaunchConfiguration('confidence_threshold'),
         }],
         remappings=[
             ('image_raw', LaunchConfiguration('input_image_topic')),
@@ -168,6 +180,7 @@ def generate_launch_description():
         output='screen',
     )
 
+    # --- Overlay visualization node ---
     overlay_node = Node(
         package='isaac_ros_segment_anything3',
         executable='overlay_node.py',
@@ -181,6 +194,7 @@ def generate_launch_description():
         output='screen',
     )
 
+    # --- Foxglove WebSocket bridge ---
     foxglove_bridge = Node(
         package='foxglove_bridge',
         executable='foxglove_bridge',
@@ -192,19 +206,27 @@ def generate_launch_description():
         output='screen',
     )
 
-    # Publish initial text prompt after delay to allow model loading.
+    # Set text prompt via service after model finishes loading.
+    # SAM3 with torch.compile takes ~40s (model load ~10s + compile ~30s).
+    # 90s delay is a safe upper bound; if the service isn't ready yet,
+    # run manually: ros2 service call /sam3/set_text_prompt ...
     initial_prompt = TimerAction(
-        period=5.0,
+        period=90.0,
         actions=[
             LogInfo(msg=[
-                'Publishing initial prompt: ',
+                'Setting initial text prompt via service: ',
                 LaunchConfiguration('text_prompt'),
             ]),
             ExecuteProcess(
                 cmd=[
-                    'ros2', 'topic', 'pub', '--once',
-                    '/sam3/text_prompt', 'std_msgs/msg/String',
-                    ['{data: "', LaunchConfiguration('text_prompt'), '"}'],
+                    'ros2', 'service', 'call',
+                    '/sam3/set_text_prompt',
+                    'isaac_ros_segment_anything3_interfaces/srv/SetTextPrompt',
+                    [
+                        '{text_prompts: ["',
+                        LaunchConfiguration('text_prompt'),
+                        '"]}',
+                    ],
                 ],
                 output='screen',
             ),
@@ -217,11 +239,11 @@ def generate_launch_description():
         input_image_topic_arg,
         fps_arg,
         loop_arg,
+        pytorch_checkpoint_arg,
+        pytorch_device_arg,
+        pytorch_compile_decoder_arg,
+        pytorch_amp_decoder_arg,
         text_prompt_arg,
-        model_type_arg,
-        inference_backend_arg,
-        model_repository_path_arg,
-        tokenizer_path_arg,
         confidence_threshold_arg,
         foxglove_port_arg,
         overlay_alpha_arg,

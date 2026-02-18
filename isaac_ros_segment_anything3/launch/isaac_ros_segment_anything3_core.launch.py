@@ -18,9 +18,9 @@
 """
 IsaacROSLaunchFragment for SAM3 text-prompted segmentation.
 
-This launch fragment integrates with the Isaac ROS Examples framework.
-SAM3 uses a standalone Python node (not ComposableNode) because it
-orchestrates three separate Triton models with tokenization logic.
+Integrates with the Isaac ROS Examples framework.
+SAM3 uses a standalone Python node (not ComposableNode) with direct
+PyTorch CUDA inference and optional TensorRT-compiled vision encoder.
 """
 
 from typing import Any, Dict
@@ -37,82 +37,56 @@ class IsaacROSSegmentAnything3LaunchFragment(IsaacROSLaunchFragment):
     @staticmethod
     def get_composable_nodes(interface_specs: Dict[str, Any]) \
             -> Dict[str, Any]:
-        # SAM3 uses a standalone Python node, not ComposableNodes,
-        # because it orchestrates three Triton models with text tokenization.
+        # SAM3 uses a standalone Python node, not ComposableNodes.
         return {}
 
     @staticmethod
     def get_launch_actions(interface_specs: Dict[str, Any]) \
             -> Dict[str, launch.actions.OpaqueFunction]:
 
-        sam3_model_type = LaunchConfiguration('sam3_model_type')
-        sam3_triton_url = LaunchConfiguration('sam3_triton_url')
-        sam3_model_repo = LaunchConfiguration('sam3_model_repo')
-        sam3_tokenizer_path = LaunchConfiguration('sam3_tokenizer_path')
+        sam3_pytorch_checkpoint = LaunchConfiguration('sam3_pytorch_checkpoint')
+        sam3_pytorch_device = LaunchConfiguration('sam3_pytorch_device')
+        sam3_pytorch_compile_decoder = LaunchConfiguration(
+            'sam3_pytorch_compile_decoder')
+        sam3_pytorch_amp_decoder = LaunchConfiguration(
+            'sam3_pytorch_amp_decoder')
         sam3_confidence_threshold = LaunchConfiguration(
             'sam3_confidence_threshold')
-        sam3_image_size = LaunchConfiguration('sam3_image_size')
-        sam3_inference_backend = LaunchConfiguration(
-            'sam3_inference_backend')
-        sam3_pytorch_checkpoint = LaunchConfiguration(
-            'sam3_pytorch_checkpoint')
-        sam3_pytorch_device = LaunchConfiguration(
-            'sam3_pytorch_device')
 
         img_topic = interface_specs.get(
             'subscribed_topics', {}).get('image', 'image_rect')
 
         return {
-            'sam3_model_type': DeclareLaunchArgument(
-                'sam3_model_type',
-                default_value='sam3',
-                description='Model type: sam3 or efficient_sam3'),
-            'sam3_triton_url': DeclareLaunchArgument(
-                'sam3_triton_url',
-                default_value='localhost:8001',
-                description='Triton gRPC server URL for SAM3'),
-            'sam3_model_repo': DeclareLaunchArgument(
-                'sam3_model_repo',
-                default_value='/tmp/models',
-                description='Triton model repository path for SAM3'),
-            'sam3_tokenizer_path': DeclareLaunchArgument(
-                'sam3_tokenizer_path',
-                default_value='/tmp/models/tokenizer.json',
-                description='Path to SAM3 tokenizer.json'),
-            'sam3_confidence_threshold': DeclareLaunchArgument(
-                'sam3_confidence_threshold',
-                default_value='0.3',
-                description='Confidence threshold for SAM3 detections'),
-            'sam3_image_size': DeclareLaunchArgument(
-                'sam3_image_size',
-                default_value='1008',
-                description='SAM3 model input image size'),
-            'sam3_inference_backend': DeclareLaunchArgument(
-                'sam3_inference_backend',
-                default_value='triton',
-                description='Inference backend: triton or pytorch'),
             'sam3_pytorch_checkpoint': DeclareLaunchArgument(
                 'sam3_pytorch_checkpoint',
-                default_value='',
-                description='PyTorch checkpoint path (empty=auto)'),
+                default_value='/tmp/models/sam3.pt',
+                description='Path to SAM3 checkpoint (sam3.pt, ~3.3GB)'),
             'sam3_pytorch_device': DeclareLaunchArgument(
                 'sam3_pytorch_device',
                 default_value='cuda',
                 description='PyTorch device (cuda or cpu)'),
+            'sam3_pytorch_compile_decoder': DeclareLaunchArgument(
+                'sam3_pytorch_compile_decoder',
+                default_value='True',
+                description='Apply torch.compile to decoder (~30s startup, ~3x faster)'),
+            'sam3_pytorch_amp_decoder': DeclareLaunchArgument(
+                'sam3_pytorch_amp_decoder',
+                default_value='True',
+                description='Use AMP FP16 for decoder (requires torch.compile)'),
+            'sam3_confidence_threshold': DeclareLaunchArgument(
+                'sam3_confidence_threshold',
+                default_value='0.3',
+                description='Confidence threshold for SAM3 detections'),
             'sam3_node': Node(
                 package='isaac_ros_segment_anything3',
                 executable='sam3_node.py',
                 name='sam3_node',
                 parameters=[{
-                    'model_type': sam3_model_type,
-                    'triton_server_url': sam3_triton_url,
-                    'model_repository_path': sam3_model_repo,
-                    'tokenizer_path': sam3_tokenizer_path,
-                    'confidence_threshold': sam3_confidence_threshold,
-                    'image_size': sam3_image_size,
-                    'inference_backend': sam3_inference_backend,
                     'pytorch_checkpoint': sam3_pytorch_checkpoint,
                     'pytorch_device': sam3_pytorch_device,
+                    'pytorch_compile_decoder': sam3_pytorch_compile_decoder,
+                    'pytorch_amp_decoder': sam3_pytorch_amp_decoder,
+                    'confidence_threshold': sam3_confidence_threshold,
                 }],
                 remappings=[
                     ('image_raw', img_topic),
