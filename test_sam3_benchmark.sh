@@ -11,7 +11,9 @@ echo "=========================================="
 echo ""
 
 # Detect workspace directory (works both in Docker and on host)
-if [ -d "/workspace" ]; then
+if [ -d "/ws" ]; then
+    WORKSPACE_DIR="/ws"
+elif [ -d "/workspace" ]; then
     WORKSPACE_DIR="/workspace"
 elif [ -d "/media/sewon/Dev/isaac_ros_image_segmentation" ]; then
     WORKSPACE_DIR="/media/sewon/Dev/isaac_ros_image_segmentation"
@@ -22,15 +24,14 @@ fi
 
 cd "$WORKSPACE_DIR" || { echo "Failed to change to workspace directory"; exit 1; }
 
-# Source ROS2 early (needed for rosbag generation and building)
-if [ -z "$ROS_DISTRO" ]; then
-    echo "Sourcing ROS2 Jazzy..."
-    if [ -f "/opt/ros/jazzy/setup.bash" ]; then
-        source /opt/ros/jazzy/setup.bash
-    else
-        echo "✗ ROS2 Jazzy not found. Are you running inside Docker?"
-        exit 1
-    fi
+# Source ROS2 early (needed for rosbag generation, ros2 CLI, and ROS packages)
+# Always source /opt/ros/jazzy/setup.bash — the Docker image may set ROS_DISTRO
+# via env variables but not add ros2 to PATH (only sourced in interactive shells)
+if [ -f "/opt/ros/jazzy/setup.bash" ]; then
+    source /opt/ros/jazzy/setup.bash
+elif [ -z "$ROS_DISTRO" ]; then
+    echo "✗ ROS2 Jazzy not found. Are you running inside Docker?"
+    exit 1
 fi
 
 # Step 1: Generate test rosbag dataset
@@ -82,24 +83,41 @@ if ! command -v jq &> /dev/null; then
     apt-get update -qq && apt-get install -y -qq jq >/dev/null 2>&1 || true
 fi
 
-# Step 2: Build packages
-echo "[2/5] Building ROS2 packages..."
+# Step 2: Source packages
+# Strategy:
+#   - Source pre-built install/ (avoids rosidl rebuild failures in Docker)
+#   - Sync latest Python scripts from source to install via direct copy
+#     (safe for pure-Python packages; no compilation needed)
+echo "[2/5] Setting up ROS2 packages..."
 
-echo "Building isaac_ros_segment_anything3_interfaces..."
-colcon build --packages-select isaac_ros_segment_anything3_interfaces \
-    --cmake-args -DCMAKE_BUILD_TYPE=Release 2>&1 | grep -E "(^Starting|^Finished|error|ERROR)" || true
+if [ ! -f "$WORKSPACE_DIR/install/setup.bash" ]; then
+    echo "✗ Pre-built install/ not found at $WORKSPACE_DIR/install/"
+    echo "  Run once inside Docker to build: colcon build --packages-select"
+    echo "  isaac_ros_segment_anything3_interfaces isaac_ros_segment_anything3"
+    echo "  isaac_ros_segment_anything3_benchmark"
+    exit 1
+fi
 
-echo "Building isaac_ros_segment_anything3..."
-colcon build --packages-select isaac_ros_segment_anything3 \
-    --cmake-args -DCMAKE_BUILD_TYPE=Release 2>&1 | grep -E "(^Starting|^Finished|error|ERROR)" || true
+# Sync latest Python scripts (bypasses colcon rebuild; instant update)
+SAM3_INSTALL_SCRIPTS="$WORKSPACE_DIR/install/isaac_ros_segment_anything3/lib/isaac_ros_segment_anything3"
+SAM3_SOURCE_SCRIPTS="$WORKSPACE_DIR/isaac_ros_segment_anything3/scripts"
+if [ -d "$SAM3_INSTALL_SCRIPTS" ] && [ -d "$SAM3_SOURCE_SCRIPTS" ]; then
+    cp "$SAM3_SOURCE_SCRIPTS/sam3_node.py" "$SAM3_INSTALL_SCRIPTS/sam3_node.py"
+    chmod +x "$SAM3_INSTALL_SCRIPTS/sam3_node.py"
+    echo "✓ Synced sam3_node.py to install/"
+fi
 
-echo "Building isaac_ros_segment_anything3_benchmark..."
-colcon build --packages-select isaac_ros_segment_anything3_benchmark \
-    --cmake-args -DCMAKE_BUILD_TYPE=Release 2>&1 | grep -E "(^Starting|^Finished|error|ERROR)" || true
+BENCH_INSTALL_SCRIPTS="$WORKSPACE_DIR/install/isaac_ros_segment_anything3_benchmark/lib/isaac_ros_segment_anything3_benchmark"
+BENCH_SOURCE_SCRIPTS="$WORKSPACE_DIR/isaac_ros_segment_anything3_benchmark/scripts"
+if [ -d "$BENCH_INSTALL_SCRIPTS" ] && [ -d "$BENCH_SOURCE_SCRIPTS" ]; then
+    cp "$BENCH_SOURCE_SCRIPTS/"*.py "$BENCH_INSTALL_SCRIPTS/" 2>/dev/null || true
+    chmod +x "$BENCH_INSTALL_SCRIPTS/"*.py 2>/dev/null || true
+    echo "✓ Synced benchmark scripts to install/"
+fi
 
-# Source workspace
-source install/setup.bash
-echo "✓ Packages built and sourced successfully"
+# Source pre-built workspace
+source "$WORKSPACE_DIR/install/setup.bash"
+echo "✓ Packages sourced"
 echo ""
 
 # Step 3: Verify Sam3Timing message
@@ -115,32 +133,12 @@ echo ""
 
 # Step 4: Check models
 echo "[4/5] Checking model availability..."
-MODEL_REPO="/tmp/esam3_models"
-
-if [ -d "$MODEL_REPO" ]; then
-    echo "✓ Model repository found at $MODEL_REPO"
-    ls -lh "$MODEL_REPO"/*.onnx 2>/dev/null || echo "  (ONNX models for Triton backend)"
-else
-    echo "⚠ Model repository not found at $MODEL_REPO"
-    echo "  For PyTorch backend, models will be downloaded automatically."
-    echo "  For Triton backend, run download_models.py first."
-fi
-echo ""
-
-# Step 5: Run benchmark
-echo "[5/5] Running SAM3 benchmark..."
-echo "=========================================="
-echo ""
-
 RESULTS_DIR="$WORKSPACE_DIR/isaac_ros_segment_anything3_benchmark/results"
 mkdir -p "$RESULTS_DIR"
 
-BACKEND="pytorch"
-MODEL_TYPE="efficient_sam3"
 ROSBAG_REMAP=""
 
 # Prefer real r2b_robotarm data if available, otherwise use dummy data
-# Check both NGC download path and symlink path
 R2B_DIR=""
 for candidate in \
     "$WORKSPACE_DIR/datasets/r2bdataset2024_v1/r2b_robotarm" \
@@ -155,77 +153,51 @@ if [ -n "$R2B_DIR" ] && ros2 bag info "$R2B_DIR" >/dev/null 2>&1; then
     BENCHMARK_DATASET="$R2B_DIR"
     DATASET_LABEL="r2b_robotarm (real)"
     TEXT_PROMPT="robot arm"
-    OUTPUT_FILE="$RESULTS_DIR/esam3_pytorch_r2b_robotarm.json"
+    OUTPUT_FILE="$RESULTS_DIR/sam3_pytorch_r2b_robotarm.json"
     # r2b uses /camera_1/color/image_raw, SAM3 subscribes to /image_raw
     ROSBAG_REMAP="--remap /camera_1/color/image_raw:=/image_raw"
 else
     BENCHMARK_DATASET="$DATASET_DIR"
     DATASET_LABEL="dummy 720p (synthetic)"
     TEXT_PROMPT="person"
-    OUTPUT_FILE="$RESULTS_DIR/esam3_pytorch_dummy_test.json"
+    OUTPUT_FILE="$RESULTS_DIR/sam3_pytorch_dummy_test.json"
 fi
 
+# Resolve checkpoint path
+MODEL_REPO="/tmp/models"
+mkdir -p "$MODEL_REPO" 2>/dev/null || true
+CHECKPOINT_PATH="$MODEL_REPO/sam3.pt"
+# Fall back to workspace-local checkpoint if /tmp/models/sam3.pt not found
+if [ ! -f "$CHECKPOINT_PATH" ]; then
+    WS_CHECKPOINT="$WORKSPACE_DIR/models/sam3/sam3.pt"
+    if [ -f "$WS_CHECKPOINT" ]; then
+        CHECKPOINT_PATH="$WS_CHECKPOINT"
+    fi
+fi
+
+if [ ! -f "$CHECKPOINT_PATH" ]; then
+    echo "✗ SAM3 checkpoint not found."
+    echo "  Expected at: $MODEL_REPO/sam3.pt or $WORKSPACE_DIR/models/sam3/sam3.pt"
+    echo "  Download from: https://huggingface.co/facebook/sam3"
+    exit 1
+fi
+size_mb=$(du -m "$CHECKPOINT_PATH" | cut -f1)
+echo "✓ SAM3 checkpoint: $CHECKPOINT_PATH (${size_mb}MB)"
+echo ""
+
+# Step 5: Run benchmark
+echo "[5/5] Running SAM3 benchmark..."
+echo "=========================================="
+echo ""
+
 echo "Configuration:"
-echo "  Backend: $BACKEND"
-echo "  Model: $MODEL_TYPE"
+echo "  Model: SAM3 (PyTorch)"
+echo "  Checkpoint: $CHECKPOINT_PATH"
 echo "  Prompt: $TEXT_PROMPT"
 echo "  Dataset: $DATASET_LABEL"
 echo "  Output: $OUTPUT_FILE"
 echo "  Duration: 30 seconds"
 echo ""
-
-# Set up model repository
-MODEL_REPO="/tmp/models"
-mkdir -p "$MODEL_REPO"
-
-# Download tokenizer if missing
-TOKENIZER_PATH="$MODEL_REPO/tokenizer.json"
-if [ ! -f "$TOKENIZER_PATH" ]; then
-    echo "Downloading tokenizer.json..."
-    wget -q -O "$TOKENIZER_PATH" \
-        'https://github.com/jamjamjon/assets/releases/download/sam3/tokenizer.json' \
-        || { echo "✗ Failed to download tokenizer"; exit 1; }
-    echo "✓ Tokenizer downloaded"
-else
-    echo "✓ Tokenizer exists at $TOKENIZER_PATH"
-fi
-
-# For PyTorch backend: check/download checkpoint
-if [ "$BACKEND" = "pytorch" ]; then
-    CHECKPOINT_PATH="$MODEL_REPO/efficient_sam3.pth"
-    if [ ! -f "$CHECKPOINT_PATH" ]; then
-        echo "Downloading EfficientSAM3 checkpoint from HuggingFace..."
-        pip install -q huggingface_hub 2>/dev/null || true
-        python3 -c "
-from huggingface_hub import hf_hub_download
-import shutil
-path = hf_hub_download(
-    repo_id='Simon7108528/EfficientSAM3',
-    filename='stage1_all_converted/efficient_sam3_tinyvit_11m_mobileclip_s1.pth',
-    local_dir='/tmp/hf_esam3',
-)
-shutil.copy2(path, '$CHECKPOINT_PATH')
-print('✓ Checkpoint downloaded')
-" || {
-            echo "⚠ HuggingFace download failed. Checking local paths..."
-            for p in /tmp/esam3_repo/checkpoints/*.pth /tmp/esam3_checkpoints/*.pth; do
-                if [ -f "\$p" ]; then
-                    cp "\$p" "$CHECKPOINT_PATH"
-                    echo "✓ Found checkpoint at \$p"
-                    break
-                fi
-            done
-        }
-        if [ ! -f "$CHECKPOINT_PATH" ]; then
-            echo "✗ Cannot find EfficientSAM3 checkpoint."
-            echo "  Download manually: https://huggingface.co/Simon7108528/EfficientSAM3"
-            echo "  Place at: $CHECKPOINT_PATH"
-            exit 1
-        fi
-    else
-        echo "✓ Checkpoint exists at $CHECKPOINT_PATH"
-    fi
-fi
 
 echo ""
 echo "Starting benchmark (this will take ~40 seconds)..."
@@ -242,17 +214,32 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Check for optional TRT vision engine (.pt2 = PyTorch 2.10+, .ep = legacy)
+TRT_VISION_ARG=""
+CHECKPOINT_DIR=$(dirname "$CHECKPOINT_PATH")
+for TRT_EXT in pt2 ep; do
+    TRT_PATH="$CHECKPOINT_DIR/vision_encoder_trt_fp16.$TRT_EXT"
+    if [ -f "$TRT_PATH" ]; then
+        TRT_VISION_ARG="-p pytorch_trt_vision_engine:=$TRT_PATH"
+        echo "  TRT vision engine: $TRT_PATH"
+        break
+    fi
+done
+if [ -z "$TRT_VISION_ARG" ]; then
+    echo "  No TRT vision engine found (will use PyTorch FP32)"
+fi
+
 # 1. Start SAM3 node in background
-echo "  Starting SAM3 node ($MODEL_TYPE, $BACKEND)..."
+echo "  Starting SAM3 node (pytorch, compile_decoder=True)..."
 ros2 run isaac_ros_segment_anything3 sam3_node.py \
     --ros-args \
-    -p model_type:=$MODEL_TYPE \
-    -p inference_backend:=$BACKEND \
-    -p model_repository_path:=$MODEL_REPO \
-    -p tokenizer_path:=$TOKENIZER_PATH \
+    -p pytorch_checkpoint:=$CHECKPOINT_PATH \
     -p image_size:=1008 \
     -p confidence_threshold:=0.3 \
     -p pytorch_device:=cuda \
+    -p pytorch_compile_decoder:=True \
+    -p pytorch_amp_decoder:=True \
+    $TRT_VISION_ARG \
     &
 SAM3_PID=$!
 
@@ -266,9 +253,9 @@ ros2 run isaac_ros_segment_anything3_benchmark sam3_monitor_node.py \
     &
 MONITOR_PID=$!
 
-# 3. Wait for SAM3 node to initialize (model loading can take 10-30s on first run)
-echo "  Waiting for SAM3 node to initialize..."
-MAX_WAIT=60
+# 3. Wait for SAM3 node to initialize (model loading + torch.compile warmup = up to 90s)
+echo "  Waiting for SAM3 node to initialize (includes torch.compile warmup ~30s)..."
+MAX_WAIT=120
 WAITED=0
 while [ $WAITED -lt $MAX_WAIT ]; do
     if ros2 service list 2>/dev/null | grep -q '/sam3/set_text_prompt'; then
@@ -353,17 +340,17 @@ if [ -f "$OUTPUT_FILE" ]; then
         ' "$OUTPUT_FILE"
 
         echo ""
-        echo "Expected vs Actual (PyTorch backend):"
-        echo "-------------------------------------"
+        echo "Expected vs Actual (SAM3 PyTorch + TRT backend, RTX 4090):"
+        echo "-----------------------------------------------------------"
 
         ACTUAL_E2E=$(jq -r '.performance_metrics.latency_ms.mean' "$OUTPUT_FILE" | awk '{printf "%.1f", $1}')
         ACTUAL_VISION=$(jq -r '.performance_metrics.stage_breakdown_ms.vision_encoder.mean' "$OUTPUT_FILE" | awk '{printf "%.1f", $1}')
         ACTUAL_DECODER=$(jq -r '.performance_metrics.stage_breakdown_ms.decoder.mean' "$OUTPUT_FILE" | awk '{printf "%.1f", $1}')
         ACTUAL_CACHE=$(jq -r '.performance_metrics.stage_breakdown_ms.text_encoder.cache_hit_rate' "$OUTPUT_FILE" | awk '{printf "%.1f", $1 * 100}')
 
-        echo "  E2E Latency: ${ACTUAL_E2E}ms (expected: ~131ms)"
-        echo "  Vision Encoder: ${ACTUAL_VISION}ms (expected: ~20ms)"
-        echo "  Decoder: ${ACTUAL_DECODER}ms (expected: ~70ms)"
+        echo "  E2E Latency: ${ACTUAL_E2E}ms (expected: ~85-95ms with TRT+compile+AMP)"
+        echo "  Vision Encoder: ${ACTUAL_VISION}ms (expected: ~30ms TRT FP16 / ~128ms PyTorch FP32)"
+        echo "  Decoder: ${ACTUAL_DECODER}ms (expected: ~35ms with compile+AMP FP16)"
         echo "  Text Cache Hit: ${ACTUAL_CACHE}% (expected: >95%)"
 
     else

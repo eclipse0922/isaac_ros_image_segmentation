@@ -18,19 +18,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Compile SAM3 / EfficientSAM3 vision backbone to TensorRT via torch_tensorrt.
+Compile SAM3 vision backbone to TensorRT via torch_tensorrt.
 
 Uses torch.export + torch_tensorrt.dynamo.compile() to avoid ONNX intermediate.
-Saves compiled engine as .ep (ExportedProgram) for fast subsequent loading.
+Saves compiled engine as .pt2 (ExportedProgram, PyTorch 2.10+ format).
 
 Usage (inside sam3_pytorch Docker container):
     python3 compile_sam3_trt.py --checkpoint /ws/models/sam3/sam3.pt \
-        --model-type sam3 \
-        --output /ws/models/sam3/vision_encoder_trt_fp16.ep
-
-    python3 compile_sam3_trt.py --checkpoint /ws/models/esam3/efficient_sam3.pth \
-        --model-type efficient_sam3 \
-        --output /ws/models/esam3/vision_encoder_trt_fp16.ep
+        --output /ws/models/sam3/vision_encoder_trt_fp16.pt2
 """
 
 import argparse
@@ -42,23 +37,13 @@ import numpy as np
 import torch
 
 
-def build_model(checkpoint_path, model_type, device):
-    if model_type == 'sam3':
-        from sam3.model_builder import build_sam3_image_model
-        return build_sam3_image_model(
-            checkpoint_path=checkpoint_path,
-            device=device,
-            load_from_HF=False,
-        )
-    else:
-        from sam3.model_builder import build_efficientsam3_image_model
-        return build_efficientsam3_image_model(
-            checkpoint_path=checkpoint_path,
-            backbone_type='tinyvit',
-            model_name='11m',
-            text_encoder_type='MobileCLIP-S1',
-            device=device,
-        )
+def build_model(checkpoint_path, device):
+    from sam3.model_builder import build_sam3_image_model
+    return build_sam3_image_model(
+        checkpoint_path=checkpoint_path,
+        device=device,
+        load_from_HF=False,
+    )
 
 
 def benchmark(fn, name, n_warmup=3, n_runs=10):
@@ -81,21 +66,27 @@ def benchmark(fn, name, n_warmup=3, n_runs=10):
 def main():
     parser = argparse.ArgumentParser(description='Compile SAM3 vision backbone to TensorRT')
     parser.add_argument('--checkpoint', required=True, help='Path to model checkpoint')
-    parser.add_argument('--model-type', default='sam3', choices=['sam3', 'efficient_sam3'])
+    parser.add_argument('--model-type', default='sam3', choices=['sam3'])
     parser.add_argument('--output', default=None, help='Output path for compiled engine')
     parser.add_argument('--precision', default='fp16', choices=['fp16', 'fp32'])
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--benchmark-only', action='store_true',
                         help='Skip compilation, just benchmark PyTorch baseline')
+    parser.add_argument('--load-engine', default=None,
+                        help='Load existing .pt2 TRT engine and benchmark vs PyTorch baseline')
+    parser.add_argument('--n-warmup', type=int, default=3,
+                        help='Number of warmup iterations for benchmark (default: 3)')
+    parser.add_argument('--n-runs', type=int, default=10,
+                        help='Number of timed iterations for benchmark (default: 10)')
     args = parser.parse_args()
 
     device = args.device
     image_size = 1008
 
-    # Default output path
+    # Default output path (.pt2 required by PyTorch 2.10+ torch.export.load)
     if args.output is None:
         ckpt_dir = os.path.dirname(args.checkpoint)
-        args.output = os.path.join(ckpt_dir, f'vision_encoder_trt_{args.precision}.ep')
+        args.output = os.path.join(ckpt_dir, f'vision_encoder_trt_{args.precision}.pt2')
 
     print(f'Model type: {args.model_type}')
     print(f'Checkpoint: {args.checkpoint}')
@@ -106,7 +97,7 @@ def main():
     # Load model
     print('Loading model...')
     t0 = time.perf_counter()
-    model = build_model(args.checkpoint, args.model_type, device)
+    model = build_model(args.checkpoint, device)
     model.eval()
     print(f'  Loaded in {time.perf_counter()-t0:.1f}s')
 
@@ -119,9 +110,28 @@ def main():
     with torch.inference_mode():
         baseline_ms = benchmark(
             lambda: vision_backbone(img_t),
-            name='vision_backbone FP32')
+            name='vision_backbone FP32',
+            n_warmup=args.n_warmup, n_runs=args.n_runs)
 
     if args.benchmark_only:
+        return
+
+    # Load-and-benchmark existing engine (no recompilation)
+    if args.load_engine:
+        print()
+        print(f'=== Load existing TRT engine: {args.load_engine} ===')
+        import torch_tensorrt  # noqa: F401
+        loaded_ep = torch.export.load(args.load_engine)
+        trt_loaded = loaded_ep.module()
+        print('  Engine loaded OK')
+        print()
+        print(f'=== Benchmark loaded TRT engine ===')
+        with torch.inference_mode():
+            trt_ms = benchmark(
+                lambda: trt_loaded(img_t),
+                name='loaded TRT engine',
+                n_warmup=args.n_warmup, n_runs=args.n_runs)
+        print(f'  Speedup vs FP32 baseline: {baseline_ms/trt_ms:.1f}x')
         return
 
     # Export
@@ -159,7 +169,8 @@ def main():
     with torch.inference_mode():
         trt_ms = benchmark(
             lambda: trt_model(img_t),
-            name=f'vision_backbone TRT {args.precision}')
+            name=f'vision_backbone TRT {args.precision}',
+            n_warmup=args.n_warmup, n_runs=args.n_runs)
     print(f'  Speedup: {baseline_ms/trt_ms:.1f}x')
 
     # Save

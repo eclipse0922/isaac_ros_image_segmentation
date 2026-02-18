@@ -18,17 +18,20 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-SAM3 / EfficientSAM3 ROS2 node for text-prompted segmentation.
+SAM3 ROS2 node for text-prompted segmentation.
 
-Supports both SAM3 (full) and EfficientSAM3 (distilled) models via
-model_type parameter. Both share the same 3-model pipeline:
+Uses the SAM3 full model with PyTorch direct CUDA inference.
+Optionally accelerated with TensorRT-compiled vision encoder and/or decoder
+(via torch_tensorrt .ep files). Decoder can also be compiled with
+torch.compile() + AMP FP16 for ~2x speedup without a TRT file.
 
 Pipeline:
-  1. Image -> preprocess -> vision_encoder (Triton) -> FPN features [cached per frame]
-  2. Text prompt -> tokenize (input_ids + attention_mask)
-     -> text_encoder (Triton) -> text_features + text_mask [cached]
-  3. FPN features + prompt_features + prompt_mask -> decoder (Triton)
-     -> pred_masks, pred_boxes (cx,cy,w,h normalized), pred_logits, presence_logits
+  1. Image -> preprocess (1008x1008, [0.5,0.5,0.5] norm)
+           -> model.backbone.forward_image() -> FPN features [per frame]
+  2. Text prompt -> model.backbone.forward_text() -> text_features [cached]
+  3. model.forward_grounding(backbone_out, find_input, geo_prompt)
+           -> pred_masks, pred_boxes (cx,cy,w,h normalized),
+              pred_logits, presence_logits
   4. Post-process -> publish Detection2DArray + segmentation mask
 
 Topics:
@@ -38,6 +41,7 @@ Topics:
   Published:
     /sam3/raw_segmentation_mask (sensor_msgs/Image, mono8)
     /sam3/detections (vision_msgs/Detection2DArray)
+    /sam3/timing (Sam3Timing)
   Services:
     /sam3/set_text_prompt (SetTextPrompt)
 """
@@ -69,72 +73,23 @@ from isaac_ros_segment_anything3_interfaces.srv import SetTextPrompt
 
 _MAX_PROMPTS = 3
 
-# Model profiles: model-specific constants for SAM3 and EfficientSAM3.
-# Both share the same 3-model pipeline (vision_encoder + text_encoder + decoder)
-# but differ in model sizes, image resolution, and default Triton model names.
-MODEL_PROFILES = {
-    'sam3': {
-        'image_size': 1008,
-        'max_seq_len': 32,
-        'mean': [0.5, 0.5, 0.5],
-        'std': [0.5, 0.5, 0.5],
-        'stretch_resize': True,
-        'default_vision_model': 'sam3_vision_encoder',
-        'default_text_model': 'sam3_text_encoder',
-        'default_decoder_model': 'sam3_decoder',
-        'pytorch_builder': 'build_sam3_image_model',
-        'pytorch_builder_kwargs': {},
-    },
-    'efficient_sam3': {
-        'image_size': 1008,
-        'max_seq_len': 32,       # Same CLIP BPE tokenizer
-        'mean': [0.5, 0.5, 0.5],
-        'std': [0.5, 0.5, 0.5],
-        'stretch_resize': True,  # Upstream uses stretch, not aspect-pad
-        'default_vision_model': 'esam3_vision_encoder',
-        'default_text_model': 'esam3_text_encoder',
-        'default_decoder_model': 'esam3_decoder',
-        'pytorch_builder': 'build_efficientsam3_image_model',
-        'pytorch_builder_kwargs': {
-            'backbone_type': 'tinyvit',
-            'model_name': '11m',
-            'text_encoder_type': 'MobileCLIP-S1',
-        },
-    },
-}
+# SAM3 full model constants (1008x1008, [0.5,0.5,0.5] normalization)
+_IMAGE_SIZE = 1008
+_MEAN = [0.5, 0.5, 0.5]
+_STD = [0.5, 0.5, 0.5]
+_STRETCH_RESIZE = True   # Stretch to square (no letterbox padding)
 
 
 class Sam3Node(Node):
-    """ROS2 node for SAM3/EfficientSAM3 text-prompted segmentation.
-
-    Supports two inference backends:
-      - 'triton': ONNX models via Triton Inference Server (default)
-      - 'pytorch': Direct PyTorch CUDA inference (~16x faster)
-    """
+    """ROS2 node for SAM3 text-prompted segmentation (PyTorch/TRT backend)."""
 
     def __init__(self):
         super().__init__('sam3_node')
 
-        # Load model profile first (determines defaults for other params)
-        self.declare_parameter('model_type', 'sam3')
-        model_type = self.get_parameter(
-            'model_type').get_parameter_value().string_value
-        if model_type not in MODEL_PROFILES:
-            self.get_logger().error(
-                f'Unknown model_type: {model_type}. '
-                f'Valid options: {list(MODEL_PROFILES.keys())}. '
-                f'Falling back to sam3.')
-            model_type = 'sam3'
-        self._model_type = model_type
-        profile = MODEL_PROFILES[model_type]
-
-        # Inference backend: 'triton' (ONNX via Triton) or 'pytorch' (direct CUDA)
-        self.declare_parameter('inference_backend', 'triton')
+        # PyTorch backend parameters
         self.declare_parameter('pytorch_checkpoint', '')
         self.declare_parameter('pytorch_device', 'cuda')
 
-        self._backend = self.get_parameter(
-            'inference_backend').get_parameter_value().string_value
         self._pytorch_checkpoint = self.get_parameter(
             'pytorch_checkpoint').get_parameter_value().string_value
         self._pytorch_device = self.get_parameter(
@@ -167,66 +122,33 @@ class Sam3Node(Node):
         self._pytorch_amp_decoder = self.get_parameter(
             'pytorch_amp_decoder').get_parameter_value().bool_value
 
-        # Declare parameters (defaults from profile)
-        self.declare_parameter('triton_server_url', 'localhost:8001')
-        self.declare_parameter('model_repository_path', '/tmp/models')
-        self.declare_parameter(
-            'vision_encoder_model_name',
-            profile['default_vision_model'])
-        self.declare_parameter(
-            'text_encoder_model_name',
-            profile['default_text_model'])
-        self.declare_parameter(
-            'decoder_model_name', profile['default_decoder_model'])
-        self.declare_parameter('tokenizer_path', '/tmp/models/tokenizer.json')
-        self.declare_parameter('image_size', profile['image_size'])
+        # Common inference parameters
+        self.declare_parameter('image_size', _IMAGE_SIZE)
         self.declare_parameter('confidence_threshold', 0.5)
         self.declare_parameter('max_prompts', _MAX_PROMPTS)
 
-        # Read parameters
-        self._triton_url = self.get_parameter(
-            'triton_server_url').get_parameter_value().string_value
-        self._model_repo = self.get_parameter(
-            'model_repository_path').get_parameter_value().string_value
-        self._vision_model = self.get_parameter(
-            'vision_encoder_model_name').get_parameter_value().string_value
-        self._text_model = self.get_parameter(
-            'text_encoder_model_name').get_parameter_value().string_value
-        self._decoder_model = self.get_parameter(
-            'decoder_model_name').get_parameter_value().string_value
-        self._tokenizer_path = self.get_parameter(
-            'tokenizer_path').get_parameter_value().string_value
         self._image_size = self.get_parameter(
             'image_size').get_parameter_value().integer_value
         self._confidence_threshold = self.get_parameter(
             'confidence_threshold').get_parameter_value().double_value
         self._max_prompts = self.get_parameter(
             'max_prompts').get_parameter_value().integer_value
-        self._max_seq_len = profile['max_seq_len']
 
-        # Initialize tokenizer
-        self._tokenizer = None
-        self._init_tokenizer()
-
-        # Initialize inference backend
-        self._triton_client = None
+        # Initialize PyTorch backend
         self._pytorch_model = None
         self._trt_decoder = None   # set in _init_pytorch_backend if .ep found
-        if self._backend == 'pytorch':
-            self._init_pytorch_backend()
-        else:
-            self._init_triton_client()
+        self._init_pytorch_backend()
 
         # State (protected by lock for thread safety)
         self._lock = threading.Lock()
         self._current_prompts = []
-        self._text_features_cache = None   # (text_features, text_mask) tuple
+        self._text_features_cache = None
         self._bridge = CvBridge()
 
-        # Image normalization from model profile
-        self._mean = np.array(profile['mean'], dtype=np.float32)
-        self._std = np.array(profile['std'], dtype=np.float32)
-        self._stretch_resize = profile.get('stretch_resize', False)
+        # Image normalization constants
+        self._mean = np.array(_MEAN, dtype=np.float32)
+        self._std = np.array(_STD, dtype=np.float32)
+        self._stretch_resize = _STRETCH_RESIZE
 
         # Subscriber: input image
         image_qos = QoSProfile(
@@ -251,87 +173,19 @@ class Sam3Node(Node):
             SetTextPrompt, 'sam3/set_text_prompt',
             self._set_text_prompt_callback)
 
-        if self._backend == 'pytorch':
-            self.get_logger().info(
-                f'SAM3 node initialized (model_type={self._model_type}, '
-                f'backend=pytorch, device={self._pytorch_device}, '
-                f'image_size={self._image_size})')
-        else:
-            self.get_logger().info(
-                f'SAM3 node initialized (model_type={self._model_type}, '
-                f'backend=triton, url={self._triton_url}, '
-                f'models=[{self._vision_model}, {self._text_model}, '
-                f'{self._decoder_model}], image_size={self._image_size})')
-
-    def _init_tokenizer(self):
-        """Initialize the HuggingFace tokenizer."""
-        try:
-            from tokenizers import Tokenizer
-            self._tokenizer = Tokenizer.from_file(self._tokenizer_path)
-            # Enable padding and truncation to fixed length
-            self._tokenizer.enable_padding(
-                length=self._max_seq_len, pad_id=0, pad_token='[PAD]')
-            self._tokenizer.enable_truncation(
-                max_length=self._max_seq_len)
-            self.get_logger().info(
-                f'Tokenizer loaded from {self._tokenizer_path} '
-                f'(max_seq_len={self._max_seq_len})')
-        except FileNotFoundError:
-            self.get_logger().error(
-                f'Tokenizer file not found: {self._tokenizer_path}. '
-                f'Run download_models.py first.')
-        except ImportError:
-            self.get_logger().error(
-                'tokenizers library not installed. '
-                'Install with: pip install tokenizers')
-
-    def _init_triton_client(self):
-        """Initialize the Triton gRPC client."""
-        try:
-            import tritonclient.grpc as grpc_client
-            self._grpc_client_module = grpc_client
-            self._triton_client = grpc_client.InferenceServerClient(
-                url=self._triton_url)
-
-            # Verify models are ready
-            for model_name in [self._vision_model, self._text_model,
-                               self._decoder_model]:
-                if self._triton_client.is_model_ready(model_name):
-                    self.get_logger().info(f'Model ready: {model_name}')
-                else:
-                    self.get_logger().warn(
-                        f'Model NOT ready: {model_name}. '
-                        f'Ensure Triton server is running with the '
-                        f'SAM3 model repository.')
-        except ImportError:
-            self.get_logger().error(
-                'tritonclient not installed. '
-                'Install with: pip install tritonclient[all]')
-        except Exception as e:
-            self.get_logger().warn(
-                f'Cannot connect to Triton at {self._triton_url}: {e}. '
-                f'Will retry on first inference request.')
+        self.get_logger().info(
+            f'SAM3 node initialized (backend=pytorch, '
+            f'device={self._pytorch_device}, '
+            f'image_size={self._image_size})')
 
     def _init_pytorch_backend(self):
         """Initialize PyTorch models for direct CUDA inference.
 
         Uses the model's own forward_grounding() method (matching upstream
-        Sam3Processor) instead of our ONNX export wrappers. This ensures
-        the geometry encoder properly processes prompts with cross-attention
+        Sam3Processor) instead of ONNX export wrappers. This ensures the
+        geometry encoder properly processes prompts with cross-attention
         to image features before the main decoder runs.
-
-        Supports both full SAM3 and EfficientSAM3 via the pytorch_builder
-        field in MODEL_PROFILES.
         """
-        profile = MODEL_PROFILES[self._model_type]
-        builder_name = profile.get('pytorch_builder')
-        builder_kwargs = profile.get('pytorch_builder_kwargs')
-        if builder_name is None:
-            self.get_logger().error(
-                f'PyTorch backend not supported for model_type='
-                f'{self._model_type}. Use inference_backend:=triton.')
-            return
-
         try:
             import torch
             self._torch = torch
@@ -344,59 +198,47 @@ class Sam3Node(Node):
         # Resolve checkpoint path
         checkpoint = self._pytorch_checkpoint
         if not checkpoint:
-            default_name = ('efficient_sam3.pth'
-                            if 'efficient' in self._model_type
-                            else 'sam3.pt')
-            checkpoint = os.path.join(self._model_repo, default_name)
+            checkpoint = os.path.join('/tmp/models', 'sam3.pt')
         if not os.path.isfile(checkpoint):
             self.get_logger().error(
                 f'PyTorch checkpoint not found: {checkpoint}. '
-                f'Run download_models.py --inference-backend pytorch')
+                f'Set pytorch_checkpoint parameter or place sam3.pt in /tmp/models/')
             return
 
         # Import builder function from sam3 package
         try:
             import sam3.model_builder as sam3_builder
             from sam3.model.data_misc import FindStage
-            build_fn = getattr(sam3_builder, builder_name)
-        except (ImportError, AttributeError) as e:
+        except ImportError as e:
             self.get_logger().error(
-                f'Cannot import {builder_name} from sam3 package: {e}. '
-                f'Install with: pip install git+https://github.com/'
-                f'SimonZeng7108/efficientsam3.git')
+                f'Cannot import sam3 package: {e}. '
+                f'Install from third_party/sam3/')
             return
 
         try:
             self.get_logger().info(
-                f'Loading PyTorch model ({builder_name}) '
-                f'from {checkpoint} ...')
+                f'Loading SAM3 PyTorch model from {checkpoint} ...')
             device = self._pytorch_device
 
-            # Build model: kwargs differ per model type
-            if builder_name == 'build_sam3_image_model':
-                model = build_fn(
-                    checkpoint_path=checkpoint,
-                    device=device,
-                    load_from_HF=False,
-                )
-            else:
-                model = build_fn(
-                    checkpoint_path=checkpoint,
-                    device=device,
-                    **builder_kwargs,
-                )
+            model = sam3_builder.build_sam3_image_model(
+                checkpoint_path=checkpoint,
+                device=device,
+                load_from_HF=False,
+            )
 
             self._pytorch_model = model
 
             # Optionally load TRT-compiled vision encoder
             trt_engine_path = self._pytorch_trt_engine
             if not trt_engine_path:
-                # Auto-detect: look for vision_encoder_trt_fp16.ep next to checkpoint
-                default_trt = os.path.join(
-                    os.path.dirname(checkpoint),
-                    'vision_encoder_trt_fp16.ep')
-                if os.path.isfile(default_trt):
-                    trt_engine_path = default_trt
+                # Auto-detect: .pt2 (PyTorch 2.10+ format) then .ep (legacy)
+                ckpt_dir = os.path.dirname(checkpoint)
+                for trt_name in ('vision_encoder_trt_fp16.pt2',
+                                 'vision_encoder_trt_fp16.ep'):
+                    candidate = os.path.join(ckpt_dir, trt_name)
+                    if os.path.isfile(candidate):
+                        trt_engine_path = candidate
+                        break
 
             if trt_engine_path and os.path.isfile(trt_engine_path):
                 try:
@@ -418,12 +260,14 @@ class Sam3Node(Node):
             # Optionally load TRT-compiled decoder
             trt_decoder_path = self._pytorch_trt_decoder_engine
             if not trt_decoder_path:
-                # Auto-detect: look for decoder_trt_fp16.ep next to checkpoint
-                default_dec = os.path.join(
-                    os.path.dirname(checkpoint),
-                    'decoder_trt_fp16.ep')
-                if os.path.isfile(default_dec):
-                    trt_decoder_path = default_dec
+                # Auto-detect: .pt2 (PyTorch 2.10+ format) then .ep (legacy)
+                ckpt_dir = os.path.dirname(checkpoint)
+                for dec_name in ('decoder_trt_fp16.pt2',
+                                 'decoder_trt_fp16.ep'):
+                    candidate = os.path.join(ckpt_dir, dec_name)
+                    if os.path.isfile(candidate):
+                        trt_decoder_path = candidate
+                        break
 
             self._trt_decoder = None
             if trt_decoder_path and os.path.isfile(trt_decoder_path):
@@ -529,8 +373,8 @@ class Sam3Node(Node):
         """
         Preprocess image for SAM3 vision encoder.
 
-        Two modes depending on model profile:
-          stretch: resize to square (upstream EfficientSAM3 convention)
+        Two modes:
+          stretch: resize to square (SAM3 convention, _STRETCH_RESIZE=True)
           pad:     aspect-preserving resize + bottom-right padding (SAM2)
 
         Args:
@@ -562,206 +406,13 @@ class Sam3Node(Node):
         # HWC -> CHW -> NCHW
         return img.transpose(2, 0, 1)[np.newaxis].astype(np.float32)
 
-    def _tokenize_text(self, prompts):
-        """
-        Tokenize text prompts using HuggingFace tokenizer.
-
-        Produces both input_ids and attention_mask with fixed sequence
-        length of max_seq_len (from model profile).
-
-        Args:
-            prompts: List of strings.
-
-        Returns:
-            Tuple of (input_ids, attention_mask):
-              - input_ids: np.ndarray of shape (num_prompts, max_seq_len), int64
-              - attention_mask: np.ndarray of shape (num_prompts, max_seq_len), int64
-            Returns (None, None) on failure.
-        """
-        if self._tokenizer is None:
-            self.get_logger().error('Tokenizer not initialized')
-            return None, None
-
-        encodings = self._tokenizer.encode_batch(prompts)
-        num_prompts = len(prompts)
-        max_seq_len = self._max_seq_len
-        input_ids = np.zeros(
-            (num_prompts, max_seq_len), dtype=np.int64)
-        attention_mask = np.zeros(
-            (num_prompts, max_seq_len), dtype=np.int64)
-
-        for i, enc in enumerate(encodings):
-            seq_len = min(len(enc.ids), max_seq_len)
-            input_ids[i, :seq_len] = enc.ids[:seq_len]
-            attention_mask[i, :seq_len] = enc.attention_mask[:seq_len]
-
-        return input_ids, attention_mask
-
-    # ----------------------------------------------------------------
-    # Triton inference
-    # ----------------------------------------------------------------
-
-    def _run_vision_encoder(self, image):
-        """
-        Run vision encoder on Triton.
-
-        Args:
-            image: np.ndarray (1, 3, 1008, 1008), float32.
-
-        Returns:
-            Tuple of (fpn_feat_0, fpn_feat_1, fpn_feat_2, fpn_pos_2)
-            as np.ndarrays, or None on failure.
-        """
-        if self._triton_client is None:
-            self.get_logger().error('Triton client not initialized')
-            return None
-
-        grpc = self._grpc_client_module
-        inputs = [grpc.InferInput('images', list(image.shape), 'FP32')]
-        inputs[0].set_data_from_numpy(image)
-
-        outputs = [
-            grpc.InferRequestedOutput('fpn_feat_0'),
-            grpc.InferRequestedOutput('fpn_feat_1'),
-            grpc.InferRequestedOutput('fpn_feat_2'),
-            grpc.InferRequestedOutput('fpn_pos_2'),
-        ]
-
-        try:
-            result = self._triton_client.infer(
-                model_name=self._vision_model,
-                inputs=inputs,
-                outputs=outputs)
-            return (
-                result.as_numpy('fpn_feat_0'),
-                result.as_numpy('fpn_feat_1'),
-                result.as_numpy('fpn_feat_2'),
-                result.as_numpy('fpn_pos_2'),
-            )
-        except Exception as e:
-            self.get_logger().error(
-                f'Vision encoder inference failed: {e}')
-            return None
-
-    def _run_text_encoder(self, input_ids, attention_mask):
-        """
-        Run text encoder on Triton.
-
-        Args:
-            input_ids: np.ndarray (num_prompts, 32), int64.
-            attention_mask: np.ndarray (num_prompts, 32), int64.
-
-        Returns:
-            Tuple of (text_features, text_mask):
-              - text_features: np.ndarray (num_prompts, 32, 256), float32
-              - text_mask: np.ndarray (num_prompts, 32), bool
-            Returns None on failure.
-        """
-        if self._triton_client is None:
-            self.get_logger().error('Triton client not initialized')
-            return None
-
-        grpc = self._grpc_client_module
-        inputs = [
-            grpc.InferInput(
-                'input_ids', list(input_ids.shape), 'INT64'),
-            grpc.InferInput(
-                'attention_mask', list(attention_mask.shape), 'INT64'),
-        ]
-        inputs[0].set_data_from_numpy(input_ids)
-        inputs[1].set_data_from_numpy(attention_mask)
-
-        outputs = [
-            grpc.InferRequestedOutput('text_features'),
-            grpc.InferRequestedOutput('text_mask'),
-        ]
-
-        try:
-            result = self._triton_client.infer(
-                model_name=self._text_model,
-                inputs=inputs,
-                outputs=outputs)
-            return (
-                result.as_numpy('text_features'),
-                result.as_numpy('text_mask'),
-            )
-        except Exception as e:
-            self.get_logger().error(
-                f'Text encoder inference failed: {e}')
-            return None
-
-    def _run_decoder(self, fpn_feat_0, fpn_feat_1, fpn_feat_2, fpn_pos_2,
-                     prompt_features, prompt_mask):
-        """
-        Run decoder on Triton.
-
-        Args:
-            fpn_feat_0: np.ndarray (-1, 256, 288, 288), float32.
-            fpn_feat_1: np.ndarray (-1, 256, 144, 144), float32.
-            fpn_feat_2: np.ndarray (-1, 256, 72, 72), float32.
-            fpn_pos_2:  np.ndarray (-1, 256, 72, 72), float32.
-            prompt_features: np.ndarray (-1, seq_len, 256), float32.
-            prompt_mask: np.ndarray (-1, seq_len), bool.
-
-        Returns:
-            Tuple of (pred_masks, pred_boxes, pred_logits, presence_logits)
-            as np.ndarrays, or None on failure.
-        """
-        if self._triton_client is None:
-            self.get_logger().error('Triton client not initialized')
-            return None
-
-        grpc = self._grpc_client_module
-        inputs = [
-            grpc.InferInput(
-                'fpn_feat_0', list(fpn_feat_0.shape), 'FP32'),
-            grpc.InferInput(
-                'fpn_feat_1', list(fpn_feat_1.shape), 'FP32'),
-            grpc.InferInput(
-                'fpn_feat_2', list(fpn_feat_2.shape), 'FP32'),
-            grpc.InferInput(
-                'fpn_pos_2', list(fpn_pos_2.shape), 'FP32'),
-            grpc.InferInput(
-                'prompt_features', list(prompt_features.shape), 'FP32'),
-            grpc.InferInput(
-                'prompt_mask', list(prompt_mask.shape), 'BOOL'),
-        ]
-        inputs[0].set_data_from_numpy(fpn_feat_0)
-        inputs[1].set_data_from_numpy(fpn_feat_1)
-        inputs[2].set_data_from_numpy(fpn_feat_2)
-        inputs[3].set_data_from_numpy(fpn_pos_2)
-        inputs[4].set_data_from_numpy(prompt_features)
-        inputs[5].set_data_from_numpy(prompt_mask)
-
-        outputs = [
-            grpc.InferRequestedOutput('pred_masks'),
-            grpc.InferRequestedOutput('pred_boxes'),
-            grpc.InferRequestedOutput('pred_logits'),
-            grpc.InferRequestedOutput('presence_logits'),
-        ]
-
-        try:
-            result = self._triton_client.infer(
-                model_name=self._decoder_model,
-                inputs=inputs,
-                outputs=outputs)
-            return (
-                result.as_numpy('pred_masks'),
-                result.as_numpy('pred_boxes'),
-                result.as_numpy('pred_logits'),
-                result.as_numpy('presence_logits'),
-            )
-        except Exception as e:
-            self.get_logger().error(f'Decoder inference failed: {e}')
-            return None
-
     # ----------------------------------------------------------------
     # PyTorch inference
     # ----------------------------------------------------------------
 
     def _run_pytorch_forward(self, image_np, prompts, text_cache):
         """
-        Run the full SAM3/EfficientSAM3 pipeline via PyTorch model directly.
+        Run the full SAM3 pipeline via PyTorch model directly.
 
         Uses model.forward_grounding() which matches upstream Sam3Processor
         exactly, including proper geometry encoder CLS processing with
@@ -953,17 +604,8 @@ class Sam3Node(Node):
             if not self._current_prompts:
                 self.get_logger().debug('No prompts set, skipping')
                 return
-            backend_ready = (
-                self._pytorch_model is not None
-                if self._backend == 'pytorch'
-                else self._triton_client is not None)
-            # PyTorch uses model.backbone.forward_text() (has own tokenizer).
-            # Triton needs our external HuggingFace tokenizer.
-            tokenizer_ready = (
-                self._backend == 'pytorch' or self._tokenizer is not None)
-            if not backend_ready or not tokenizer_ready:
-                self.get_logger().warn(
-                    'Inference backend or tokenizer not ready, skipping')
+            if self._pytorch_model is None:
+                self.get_logger().warn('PyTorch model not ready, skipping')
                 return
             current_prompts = list(self._current_prompts)
             text_cache = self._text_features_cache
@@ -989,165 +631,76 @@ class Sam3Node(Node):
         preprocessed = self._preprocess_image(cv_image)
         _t_preproc = _time.perf_counter()
 
-        if self._backend == 'pytorch':
-            # PyTorch: use model.forward_grounding() directly.
-            # This matches upstream Sam3Processor exactly, including
-            # proper geometry encoder CLS processing.
-            text_cache_hit = (text_cache is not None)
+        # PyTorch: use model.forward_grounding() directly.
+        # This matches upstream Sam3Processor exactly, including
+        # proper geometry encoder CLS processing.
+        text_cache_hit = (text_cache is not None)
 
-            results, text_cache_new, stage_times = self._run_pytorch_forward(
-                preprocessed, current_prompts, text_cache)
-            if results is None:
-                return
+        results, text_cache_new, stage_times = self._run_pytorch_forward(
+            preprocessed, current_prompts, text_cache)
+        if results is None:
+            return
 
-            _t_model = _time.perf_counter()
+        _t_model = _time.perf_counter()
 
-            # Update text cache under lock
-            if not text_cache_hit and text_cache_new is not None:
-                with self._lock:
-                    if self._current_prompts == current_prompts:
-                        self._text_features_cache = text_cache_new
+        # Update text cache under lock
+        if not text_cache_hit and text_cache_new is not None:
+            with self._lock:
+                if self._current_prompts == current_prompts:
+                    self._text_features_cache = text_cache_new
 
-            # Stack results across prompts
-            num_prompts = len(results)
-            all_masks = []
-            all_boxes = []
-            all_logits = []
-            all_presence = []
-            for r in results:
-                # forward_grounding output shapes:
-                #   pred_masks: [1, 200, 288, 288]
-                #   pred_boxes: [1, 200, 4]
-                #   pred_logits: [1, 200, 1]
-                #   presence: [1, 1] (per-text-prompt, not per-query)
-                all_masks.append(r['pred_masks'][0])       # (200, 288, 288)
-                all_boxes.append(r['pred_boxes'][0])       # (200, 4)
-                all_logits.append(r['pred_logits'][0])     # (200, 1)
-                all_presence.append(r['presence'][0])      # (1,)
+        # Stack results across prompts
+        num_prompts = len(results)
+        all_masks = []
+        all_boxes = []
+        all_logits = []
+        all_presence = []
+        for r in results:
+            # forward_grounding output shapes:
+            #   pred_masks: [1, 200, 288, 288]
+            #   pred_boxes: [1, 200, 4]
+            #   pred_logits: [1, 200, 1]
+            #   presence: [1, 1] (per-text-prompt, not per-query)
+            all_masks.append(r['pred_masks'][0])       # (200, 288, 288)
+            all_boxes.append(r['pred_boxes'][0])       # (200, 4)
+            all_logits.append(r['pred_logits'][0])     # (200, 1)
+            all_presence.append(r['presence'][0])      # (1,)
 
-            pred_masks = np.stack(all_masks)       # (N, 200, 288, 288)
-            pred_boxes = np.stack(all_boxes)       # (N, 200, 4)
-            pred_logits = np.stack(all_logits)     # (N, 200, 1)
-            presence_logits = np.stack(all_presence)  # (N, 1)
+        pred_masks = np.stack(all_masks)       # (N, 200, 288, 288)
+        pred_boxes = np.stack(all_boxes)       # (N, 200, 4)
+        pred_logits = np.stack(all_logits)     # (N, 200, 1)
+        presence_logits = np.stack(all_presence)  # (N, 1)
 
-            # 5. Post-process and publish
-            self._publish_results(
-                msg.header, orig_h, orig_w,
-                pred_masks, pred_boxes, pred_logits, presence_logits,
-                current_prompts, confidence_threshold)
-            _t_end = _time.perf_counter()
+        # 5. Post-process and publish
+        self._publish_results(
+            msg.header, orig_h, orig_w,
+            pred_masks, pred_boxes, pred_logits, presence_logits,
+            current_prompts, confidence_threshold)
+        _t_end = _time.perf_counter()
 
-            # Per-stage timing from _run_pytorch_forward CUDA sync points.
-            # stage_times['_t_vision/_t_text/_t_decoder'] are absolute timestamps.
-            _t_preproc_end = _t_preproc  # alias for clarity
-            t_vis = stage_times.get('_t_vision', _t_model)
-            t_txt = stage_times.get('_t_text', _t_model)
-            t_dec = stage_times.get('_t_decoder', _t_model)
+        # Per-stage timing from _run_pytorch_forward CUDA sync points.
+        # stage_times['_t_vision/_t_text/_t_decoder'] are absolute timestamps.
+        _t_preproc_end = _t_preproc  # alias for clarity
+        t_vis = stage_times.get('_t_vision', _t_model)
+        t_txt = stage_times.get('_t_text', _t_model)
+        t_dec = stage_times.get('_t_decoder', _t_model)
 
-            timing_msg = Sam3Timing()
-            timing_msg.header.stamp = self.get_clock().now().to_msg()
-            timing_msg.cvbridge_ms = (_t_cvbridge - _t_start) * 1000.0
-            timing_msg.preprocess_ms = (_t_preproc_end - _t_cvbridge) * 1000.0
-            # vision_encoder_ms: from end of preproc to end of forward_image
-            timing_msg.vision_encoder_ms = (t_vis - _t_preproc_end) * 1000.0
-            # text_encoder_ms: from end of vision to end of forward_text
-            timing_msg.text_encoder_ms = (t_txt - t_vis) * 1000.0
-            timing_msg.text_encoder_cache_hit = text_cache_hit
-            # decoder_ms: from end of text to end of all decoder calls
-            timing_msg.decoder_ms = (t_dec - t_txt) * 1000.0
-            timing_msg.num_prompts = num_prompts
-            timing_msg.postprocess_ms = (_t_end - _t_model) * 1000.0
-            timing_msg.total_ms = (_t_end - _t_start) * 1000.0
-            timing_msg.backend = self._backend
-            timing_msg.model_type = self._model_type
-
-        else:
-            # Triton: 3-stage pipeline (vision → text → decoder)
-            # 2. Vision encoder
-            vision_result = self._run_vision_encoder(preprocessed)
-            if vision_result is None:
-                return
-            _t_vision = _time.perf_counter()
-
-            # 3. Text encoder (cached until prompt changes)
-            _t_text_start = _time.perf_counter()
-            text_cache_hit = (text_cache is not None)
-
-            if text_cache is not None:
-                text_features, text_mask = text_cache
-            else:
-                input_ids, attention_mask = self._tokenize_text(
-                    current_prompts)
-                if input_ids is None:
-                    return
-                text_result = self._run_text_encoder(
-                    input_ids, attention_mask)
-                if text_result is None:
-                    return
-                text_features, text_mask = text_result
-                with self._lock:
-                    if self._current_prompts == current_prompts:
-                        self._text_features_cache = (
-                            text_features, text_mask)
-
-            _t_text_end = _time.perf_counter()
-
-            # 4. Decoder: run per-prompt (batch=1).
-            all_masks = []
-            all_boxes = []
-            all_logits = []
-            all_presence = []
-
-            num_prompts = text_features.shape[0]
-            fpn_feat_0, fpn_feat_1, fpn_feat_2, fpn_pos_2 = vision_result
-            for p_idx in range(num_prompts):
-                pf = text_features[p_idx:p_idx + 1].astype(np.float32)
-                pm = text_mask[p_idx:p_idx + 1].astype(bool)
-                decoder_result = self._run_decoder(
-                    fpn_feat_0, fpn_feat_1, fpn_feat_2, fpn_pos_2,
-                    pf, pm)
-                if decoder_result is None:
-                    continue
-                masks, boxes, logits, presence = decoder_result
-                all_masks.append(masks[0])
-                all_boxes.append(boxes[0])
-                all_logits.append(logits[0])
-                all_presence.append(presence[0])
-
-            _t_decoder = _time.perf_counter()
-
-            if not all_masks:
-                return
-
-            pred_masks = np.stack(all_masks)
-            pred_boxes = np.stack(all_boxes)
-            pred_logits = np.stack(all_logits)
-            presence_logits = np.stack(all_presence)
-
-            # 5. Post-process and publish
-            self._publish_results(
-                msg.header, orig_h, orig_w,
-                pred_masks, pred_boxes, pred_logits, presence_logits,
-                current_prompts, confidence_threshold)
-            _t_end = _time.perf_counter()
-
-            timing_msg = Sam3Timing()
-            timing_msg.header.stamp = self.get_clock().now().to_msg()
-            timing_msg.cvbridge_ms = (_t_cvbridge - _t_start) * 1000.0
-            timing_msg.preprocess_ms = (_t_preproc - _t_cvbridge) * 1000.0
-            timing_msg.vision_encoder_ms = (
-                _t_vision - _t_preproc) * 1000.0
-            timing_msg.text_encoder_ms = (
-                _t_text_end - _t_text_start) * 1000.0
-            timing_msg.text_encoder_cache_hit = text_cache_hit
-            timing_msg.decoder_ms = (
-                _t_decoder - _t_vision
-                - (_t_text_end - _t_text_start)) * 1000.0
-            timing_msg.num_prompts = num_prompts
-            timing_msg.postprocess_ms = (_t_end - _t_decoder) * 1000.0
-            timing_msg.total_ms = (_t_end - _t_start) * 1000.0
-            timing_msg.backend = self._backend
-            timing_msg.model_type = self._model_type
+        timing_msg = Sam3Timing()
+        timing_msg.header.stamp = self.get_clock().now().to_msg()
+        timing_msg.cvbridge_ms = (_t_cvbridge - _t_start) * 1000.0
+        timing_msg.preprocess_ms = (_t_preproc_end - _t_cvbridge) * 1000.0
+        # vision_encoder_ms: from end of preproc to end of forward_image
+        timing_msg.vision_encoder_ms = (t_vis - _t_preproc_end) * 1000.0
+        # text_encoder_ms: from end of vision to end of forward_text
+        timing_msg.text_encoder_ms = (t_txt - t_vis) * 1000.0
+        timing_msg.text_encoder_cache_hit = text_cache_hit
+        # decoder_ms: from end of text to end of all decoder calls
+        timing_msg.decoder_ms = (t_dec - t_txt) * 1000.0
+        timing_msg.num_prompts = num_prompts
+        timing_msg.postprocess_ms = (_t_end - _t_model) * 1000.0
+        timing_msg.total_ms = (_t_end - _t_start) * 1000.0
+        timing_msg.backend = 'pytorch'
+        timing_msg.model_type = 'sam3'
 
         self._timing_pub.publish(timing_msg)
 
@@ -1235,9 +788,7 @@ class Sam3Node(Node):
         presence_scores = 1.0 / (
             1.0 + np.exp(-presence_logits.astype(np.float64)))
 
-        # Handle shape variations between PyTorch and Triton backends:
-        # PyTorch (forward_grounding): logits (B,200,1), presence (B,1)
-        # Triton (DecoderWrapper):     logits (B,200),   presence (B,1)
+        # Handle shape: forward_grounding outputs logits (B,200,1), presence (B,1)
         if det_scores.ndim == 3:
             det_scores = det_scores.squeeze(-1)  # (B, 200, 1) -> (B, 200)
         # presence (B, 1) broadcasts with det_scores (B, 200) -> (B, 200)
