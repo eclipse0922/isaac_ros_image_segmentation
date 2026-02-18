@@ -140,6 +140,13 @@ class Sam3Node(Node):
         self._pytorch_device = self.get_parameter(
             'pytorch_device').get_parameter_value().string_value
 
+        # Optional TensorRT compiled vision encoder (.ep file).
+        # When provided, replaces the PyTorch vision backbone for ~4x speedup.
+        # Compile with: scripts/compile_sam3_trt.py
+        self.declare_parameter('pytorch_trt_vision_engine', '')
+        self._pytorch_trt_engine = self.get_parameter(
+            'pytorch_trt_vision_engine').get_parameter_value().string_value
+
         # Declare parameters (defaults from profile)
         self.declare_parameter('triton_server_url', 'localhost:8001')
         self.declare_parameter('model_repository_path', '/tmp/models')
@@ -359,6 +366,33 @@ class Sam3Node(Node):
                 )
 
             self._pytorch_model = model
+
+            # Optionally load TRT-compiled vision encoder
+            trt_engine_path = self._pytorch_trt_engine
+            if not trt_engine_path:
+                # Auto-detect: look for vision_encoder_trt_fp16.ep next to checkpoint
+                default_trt = os.path.join(
+                    os.path.dirname(checkpoint),
+                    'vision_encoder_trt_fp16.ep')
+                if os.path.isfile(default_trt):
+                    trt_engine_path = default_trt
+
+            if trt_engine_path and os.path.isfile(trt_engine_path):
+                try:
+                    self.get_logger().info(
+                        f'Loading TRT vision engine from {trt_engine_path} ...')
+                    # torch_tensorrt must be imported to register custom TRT ops
+                    # before torch.export.load() can deserialize the engine
+                    import torch_tensorrt  # noqa: F401
+                    loaded_ep = torch.export.load(trt_engine_path)
+                    trt_vision = loaded_ep.module()
+                    # Drop-in replace: preserves (list[4], list[4], None, None) output
+                    model.backbone.vision_backbone = trt_vision
+                    self.get_logger().info(
+                        'TRT vision engine loaded — vision encoder ~4x faster (FP16)')
+                except Exception as e:
+                    self.get_logger().warn(
+                        f'Failed to load TRT engine ({e}), using PyTorch FP32')
 
             # Pre-create FindStage for single-image inference
             # (reused across frames, only text_ids changes per prompt)
