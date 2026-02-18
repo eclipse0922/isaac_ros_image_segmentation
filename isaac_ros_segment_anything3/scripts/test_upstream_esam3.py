@@ -58,6 +58,9 @@ def main():
                         help='Confidence threshold (default: 0.5)')
     parser.add_argument('--output', default=None,
                         help='Path to save output mask (optional)')
+    parser.add_argument('--model-type', default='efficient_sam3',
+                        choices=['sam3', 'efficient_sam3'],
+                        help='Model type (default: efficient_sam3)')
     parser.add_argument('--backbone-type', default='tinyvit')
     parser.add_argument('--model-name', default='11m')
     parser.add_argument('--text-encoder-type', default='MobileCLIP-S1')
@@ -67,20 +70,28 @@ def main():
     # Load model
     print(f'Loading model from {args.checkpoint} ...')
     try:
-        from sam3 import build_efficientsam3_image_model
+        from sam3.model_builder import (
+            build_sam3_image_model, build_efficientsam3_image_model)
     except ImportError:
         print('ERROR: sam3 package not found. Install with:')
         print('  pip install git+https://github.com/SimonZeng7108/'
               'efficientsam3.git@77e830355cb164b6bfe18d1f1f3f35d04ef73e70')
         sys.exit(1)
 
-    model = build_efficientsam3_image_model(
-        checkpoint_path=args.checkpoint,
-        backbone_type=args.backbone_type,
-        model_name=args.model_name,
-        text_encoder_type=args.text_encoder_type,
-        device=args.device,
-    )
+    if args.model_type == 'sam3':
+        model = build_sam3_image_model(
+            checkpoint_path=args.checkpoint,
+            device=args.device,
+            load_from_HF=False,
+        )
+    else:
+        model = build_efficientsam3_image_model(
+            checkpoint_path=args.checkpoint,
+            backbone_type=args.backbone_type,
+            model_name=args.model_name,
+            text_encoder_type=args.text_encoder_type,
+            device=args.device,
+        )
 
     from sam3.model.sam3_image_processor import Sam3Processor
     processor = Sam3Processor(

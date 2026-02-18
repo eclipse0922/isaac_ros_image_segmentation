@@ -76,11 +76,14 @@ MODEL_PROFILES = {
     'sam3': {
         'image_size': 1008,
         'max_seq_len': 32,
-        'mean': [0.485, 0.456, 0.406],
-        'std': [0.229, 0.224, 0.225],
+        'mean': [0.5, 0.5, 0.5],
+        'std': [0.5, 0.5, 0.5],
+        'stretch_resize': True,
         'default_vision_model': 'sam3_vision_encoder',
         'default_text_model': 'sam3_text_encoder',
         'default_decoder_model': 'sam3_decoder',
+        'pytorch_builder': 'build_sam3_image_model',
+        'pytorch_builder_kwargs': {},
     },
     'efficient_sam3': {
         'image_size': 1008,
@@ -288,10 +291,14 @@ class Sam3Node(Node):
         Sam3Processor) instead of our ONNX export wrappers. This ensures
         the geometry encoder properly processes prompts with cross-attention
         to image features before the main decoder runs.
+
+        Supports both full SAM3 and EfficientSAM3 via the pytorch_builder
+        field in MODEL_PROFILES.
         """
         profile = MODEL_PROFILES[self._model_type]
+        builder_name = profile.get('pytorch_builder')
         builder_kwargs = profile.get('pytorch_builder_kwargs')
-        if builder_kwargs is None:
+        if builder_name is None:
             self.get_logger().error(
                 f'PyTorch backend not supported for model_type='
                 f'{self._model_type}. Use inference_backend:=triton.')
@@ -309,36 +316,47 @@ class Sam3Node(Node):
         # Resolve checkpoint path
         checkpoint = self._pytorch_checkpoint
         if not checkpoint:
-            checkpoint = os.path.join(
-                self._model_repo, 'efficient_sam3.pth')
+            default_name = ('efficient_sam3.pth'
+                            if 'efficient' in self._model_type
+                            else 'sam3.pt')
+            checkpoint = os.path.join(self._model_repo, default_name)
         if not os.path.isfile(checkpoint):
             self.get_logger().error(
                 f'PyTorch checkpoint not found: {checkpoint}. '
                 f'Run download_models.py --inference-backend pytorch')
             return
 
-        # Build model using sam3 package directly
+        # Import builder function from sam3 package
         try:
-            from sam3 import build_efficientsam3_image_model
+            import sam3.model_builder as sam3_builder
             from sam3.model.data_misc import FindStage
-        except ImportError as e:
+            build_fn = getattr(sam3_builder, builder_name)
+        except (ImportError, AttributeError) as e:
             self.get_logger().error(
-                f'Cannot import sam3 package: {e}. '
+                f'Cannot import {builder_name} from sam3 package: {e}. '
                 f'Install with: pip install git+https://github.com/'
                 f'SimonZeng7108/efficientsam3.git')
             return
 
         try:
             self.get_logger().info(
-                f'Loading PyTorch model from {checkpoint} ...')
+                f'Loading PyTorch model ({builder_name}) '
+                f'from {checkpoint} ...')
             device = self._pytorch_device
-            model = build_efficientsam3_image_model(
-                checkpoint_path=checkpoint,
-                backbone_type=builder_kwargs['backbone_type'],
-                model_name=builder_kwargs['model_name'],
-                text_encoder_type=builder_kwargs.get('text_encoder_type'),
-                device=device,
-            )
+
+            # Build model: kwargs differ per model type
+            if builder_name == 'build_sam3_image_model':
+                model = build_fn(
+                    checkpoint_path=checkpoint,
+                    device=device,
+                    load_from_HF=False,
+                )
+            else:
+                model = build_fn(
+                    checkpoint_path=checkpoint,
+                    device=device,
+                    **builder_kwargs,
+                )
 
             self._pytorch_model = model
 
