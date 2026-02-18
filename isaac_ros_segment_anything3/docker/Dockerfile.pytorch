@@ -10,7 +10,7 @@
 #     -v /tmp:/tmp \
 #     sam3_pytorch:latest bash
 #
-ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:24.12-py3
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.01-py3
 FROM ${BASE_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive
