@@ -34,13 +34,14 @@ Parameters:
     alpha (float): Mask overlay opacity. Default: 0.45
 """
 
+import threading
+
 import numpy as np
 
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 
-import message_filters
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
 
@@ -62,30 +63,40 @@ class OverlayNode(Node):
             'alpha').get_parameter_value().double_value
 
         self._bridge = CvBridge()
+        self._latest_mask = None   # most recently received mask (numpy)
+        self._mask_lock = threading.Lock()
 
         # Publisher
         self._pub = self.create_publisher(Image, 'sam3/overlay', 10)
 
-        # Synchronized subscribers.
-        # image_raw uses BEST_EFFORT to match bag players and camera drivers.
-        # raw_segmentation_mask is published RELIABLE by sam3_node.
-        image_qos = QoSProfile(depth=5, reliability=ReliabilityPolicy.BEST_EFFORT)
-        mask_qos = QoSProfile(depth=5, reliability=ReliabilityPolicy.RELIABLE)
-        image_sub = message_filters.Subscriber(
-            self, Image, 'image_raw', qos_profile=image_qos)
-        mask_sub = message_filters.Subscriber(
-            self, Image, 'sam3/raw_segmentation_mask', qos_profile=mask_qos)
+        # Image subscriber: apply latest mask on every new frame.
+        # No timestamp sync — mask arrives at SAM3's rate (~8fps),
+        # image arrives at camera/bag rate (~30fps). Latch-style overlay
+        # avoids frame-dropping and queue mismatch.
+        image_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+        mask_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE)
 
-        self._sync = message_filters.ApproximateTimeSynchronizer(
-            [image_sub, mask_sub], queue_size=5, slop=0.5)
-        self._sync.registerCallback(self._callback)
+        self.create_subscription(Image, 'image_raw', self._image_callback, image_qos)
+        self.create_subscription(
+            Image, 'sam3/raw_segmentation_mask', self._mask_callback, mask_qos)
 
         self.get_logger().info(
             f'Overlay node ready (alpha={self._alpha:.2f})')
 
-    def _callback(self, image_msg, mask_msg):
-        image = self._bridge.imgmsg_to_cv2(image_msg, 'rgb8')
+    def _mask_callback(self, mask_msg):
         mask = self._bridge.imgmsg_to_cv2(mask_msg, 'mono8')
+        with self._mask_lock:
+            self._latest_mask = mask
+
+    def _image_callback(self, image_msg):
+        with self._mask_lock:
+            mask = self._latest_mask
+
+        if mask is None:
+            self._pub.publish(image_msg)
+            return
+
+        image = self._bridge.imgmsg_to_cv2(image_msg, 'rgb8')
 
         # Resize mask to image size if needed
         if mask.shape[:2] != image.shape[:2]:
