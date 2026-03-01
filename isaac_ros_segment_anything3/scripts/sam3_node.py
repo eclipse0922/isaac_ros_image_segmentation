@@ -180,6 +180,8 @@ class Sam3Node(Node):
         # Publishers
         self._mask_pub = self.create_publisher(
             Image, 'sam3/raw_segmentation_mask', 10)
+        self._input_image_pub = self.create_publisher(
+            Image, 'sam3/input_image', 10)
         self._detection_pub = self.create_publisher(
             Detection2DArray, 'sam3/detections', 10)
         self._timing_pub = self.create_publisher(
@@ -739,6 +741,7 @@ class Sam3Node(Node):
         presence_logits = np.stack(all_presence)  # (N, 1)
 
         # 5. Post-process and publish
+        self._input_image_pub.publish(msg)
         self._publish_results(
             msg.header, orig_h, orig_w,
             pred_masks, pred_boxes, pred_logits, presence_logits,

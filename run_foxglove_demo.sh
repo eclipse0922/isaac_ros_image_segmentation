@@ -179,9 +179,7 @@ docker run --rm --runtime=nvidia \
         SAM3_PID=\$!
 
         echo '[demo] Starting overlay node...'
-        ros2 run isaac_ros_segment_anything3 overlay_node.py \
-            --ros-args \
-            --remap image_raw:=$IMAGE_TOPIC &
+        ros2 run isaac_ros_segment_anything3 overlay_node.py &
         OVERLAY_PID=\$!
 
         echo '[demo] Starting foxglove_bridge on port $FOXGLOVE_PORT...'
