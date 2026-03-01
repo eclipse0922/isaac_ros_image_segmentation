@@ -148,6 +148,14 @@ Key implementation details:
 
 ---
 
+## Future Work
+
+- **C++ NITROS zero-copy**: The vision encoder is already exported as a TRT engine (`.pt2`). A C++ `ComposableNode` wrapping it with NITROS image transport would enable zero-copy GPU input — the natural Isaac ROS path. The decoder currently cannot be TRT-exported (`pin_memory` not supported in `torch.export`), so it would remain Python, but the image-to-features path could be fully GPU-resident.
+- **Decoder TRT export**: If the upstream SAM3 decoder removes the `pin_memory` dependency, full TRT deployment via `torch_tensorrt` becomes straightforward.
+- **Dynamic batch / multi-camera**: The current node is single-image, single-camera. Batching across multiple camera streams would improve GPU utilization.
+
+---
+
 ## Original NVIDIA Packages
 
 The packages below are from the original NVIDIA Isaac ROS release and remain unchanged in this fork. Refer to the [upstream documentation](https://nvidia-isaac-ros.github.io/repositories_and_packages/isaac_ros_image_segmentation/index.html) for usage.
