@@ -1,24 +1,16 @@
 #!/bin/bash
-# SPDX-FileCopyrightText: NVIDIA CORPORATION & AFFILIATES
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-#
 # SAM3 Foxglove Demo
+#
 # Launches SAM3 node + overlay + foxglove_bridge inside Docker.
 # Connect Foxglove Studio to ws://localhost:8765 to visualize.
 #
-# Usage (from host):
-#   # Video file input:
-#   ./run_foxglove_demo.sh --video /path/to/video.mp4
+# Usage:
+#   ./run_foxglove_demo.sh                          # auto-downloads r2b_robotarm, runs with "robot arm" prompt
+#   ./run_foxglove_demo.sh --prompt "person"        # same dataset, different prompt
+#   ./run_foxglove_demo.sh --video /path/to/vid.mp4 # use a video file instead
+#   ./run_foxglove_demo.sh --bag /path/to/bag       # use a custom rosbag
 #
-#   # Rosbag input:
-#   ./run_foxglove_demo.sh --bag /path/to/bag_folder [--topic /image_raw]
-#
-#   # Rosbag with non-default image topic (e.g. r2b_robotarm):
-#   ./run_foxglove_demo.sh --bag datasets/r2bdataset2024_v1/r2b_robotarm \
-#       --topic /camera_1/color/image_raw --prompt "robot arm"
-#
-# After the node is ready (~40s), set/change the text prompt via:
+# After the node is ready (~40s), change the text prompt live:
 #   docker exec sam3_foxglove \
 #     ros2 service call /sam3/set_text_prompt \
 #     isaac_ros_segment_anything3_interfaces/srv/SetTextPrompt \
@@ -30,23 +22,25 @@ WORKSPACE_DIR="$(cd "$(dirname "$0")" && pwd)"
 CONTAINER_NAME="sam3_foxglove"
 
 # Defaults
-INPUT_TYPE=""
-INPUT_PATH=""
-IMAGE_TOPIC="image_raw"
-TEXT_PROMPT="person"
+INPUT_TYPE="bag"
+IMAGE_TOPIC="/camera_1/color/image_raw"
+TEXT_PROMPT="robot arm"
 FOXGLOVE_PORT=8765
 CHECKPOINT_PATH="$WORKSPACE_DIR/models/sam3/sam3.pt"
+DATASET_DIR="$WORKSPACE_DIR/datasets/r2bdataset2024_v1/r2b_robotarm"
+CUSTOM_BAG=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
         --video)
             INPUT_TYPE="video"
-            INPUT_PATH="$2"
+            CUSTOM_BAG="$2"
+            IMAGE_TOPIC="image_raw"
             shift 2 ;;
         --bag)
             INPUT_TYPE="bag"
-            INPUT_PATH="$2"
+            CUSTOM_BAG="$2"
             shift 2 ;;
         --topic)
             IMAGE_TOPIC="$2"
@@ -66,56 +60,84 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [ -z "$INPUT_TYPE" ]; then
-    echo "Error: specify --video <path> or --bag <path>"
-    echo ""
-    echo "Usage:"
-    echo "  $0 --video /path/to/video.mp4 [--prompt 'cat']"
-    echo "  $0 --bag /path/to/bag [--topic /camera/image_raw] [--prompt 'robot arm']"
-    exit 1
-fi
-
+# ── Checkpoint check ──────────────────────────────────────────────────────────
 if [ ! -f "$CHECKPOINT_PATH" ]; then
     echo "Error: SAM3 checkpoint not found at: $CHECKPOINT_PATH"
-    echo "Download from: https://huggingface.co/facebook/sam3"
+    echo ""
+    echo "Download it from HuggingFace (requires access request):"
+    echo "  pip install huggingface_hub"
+    echo "  huggingface-cli login"
+    echo "  huggingface-cli download facebook/sam3 sam3.pt --local-dir models/sam3"
     exit 1
 fi
 
-# Convert host path to Docker-internal path.
-# The workspace is mounted at /ws inside the container.
-# Any path under WORKSPACE_DIR is rewritten to /ws/...
-# Any other absolute path is passed through (must be mounted separately).
+# ── Dataset: auto-download r2b_robotarm if no custom input specified ──────────
+if [ "$INPUT_TYPE" = "bag" ] && [ -z "$CUSTOM_BAG" ]; then
+    MCAP_FILE="$DATASET_DIR/r2b_robotarm_0.mcap"
+
+    if [ ! -f "$MCAP_FILE" ]; then
+        echo "r2b_robotarm dataset not found. Downloading (~1.4 GB)..."
+        echo ""
+        mkdir -p "$DATASET_DIR"
+
+        BASE_URL="https://api.ngc.nvidia.com/v2/resources/nvidia/isaac/r2bdataset2024/versions/1/files/r2b_robotarm"
+
+        wget -q --show-progress -O "$DATASET_DIR/metadata.yaml" \
+            "$BASE_URL/metadata.yaml" || {
+            echo "Error: failed to download metadata.yaml"
+            echo "Check your internet connection or download manually."
+            exit 1
+        }
+
+        wget -q --show-progress -O "$DATASET_DIR/r2b_robotarm_0.mcap" \
+            "$BASE_URL/r2b_robotarm_0.mcap" || {
+            echo "Error: failed to download r2b_robotarm_0.mcap"
+            rm -f "$DATASET_DIR/r2b_robotarm_0.mcap"
+            exit 1
+        }
+
+        echo ""
+        echo "Download complete."
+    fi
+
+    INPUT_PATH="$DATASET_DIR"
+else
+    INPUT_PATH="$CUSTOM_BAG"
+fi
+
+# ── Resolve Docker-internal path ──────────────────────────────────────────────
 INPUT_PATH="$(realpath "$INPUT_PATH" 2>/dev/null || echo "$INPUT_PATH")"
 if [[ "$INPUT_PATH" == "$WORKSPACE_DIR"* ]]; then
     DOCKER_INPUT_PATH="/ws${INPUT_PATH#$WORKSPACE_DIR}"
 else
-    DOCKER_INPUT_PATH="$INPUT_PATH"
-    echo "Warning: $INPUT_PATH is outside workspace — make sure it's accessible inside Docker"
+    echo "Warning: $INPUT_PATH is outside the workspace — mounting it as read-only at /data"
+    DOCKER_INPUT_PATH="/data"
+    EXTRA_MOUNT="-v ${INPUT_PATH}:/data:ro"
 fi
 
 echo "=========================================="
 echo "SAM3 Foxglove Demo"
 echo "=========================================="
-echo "  Input: $INPUT_TYPE → $INPUT_PATH (→ $DOCKER_INPUT_PATH in container)"
-echo "  Topic: $IMAGE_TOPIC"
-echo "  Prompt: $TEXT_PROMPT"
-echo "  Foxglove port: $FOXGLOVE_PORT"
+echo "  Input:    $INPUT_TYPE → $INPUT_PATH"
+echo "  Topic:    $IMAGE_TOPIC"
+echo "  Prompt:   $TEXT_PROMPT"
+echo "  Port:     $FOXGLOVE_PORT"
 echo "  Checkpoint: $CHECKPOINT_PATH"
 echo ""
 echo "  Connect Foxglove Studio to: ws://localhost:$FOXGLOVE_PORT"
-echo "  Recommended panels: Image (sam3/overlay), Raw Messages (sam3/detections)"
+echo "  Panels: Image (sam3/overlay)  |  Raw Messages (sam3/detections)"
 echo "=========================================="
 echo ""
 
-# Stop existing container if running
+# ── Launch ────────────────────────────────────────────────────────────────────
 docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
-# Launch Docker container with the demo
 docker run --rm --runtime=nvidia \
     --name "$CONTAINER_NAME" \
     --network host \
     -v "$WORKSPACE_DIR:/ws" \
     -v /tmp:/tmp \
+    ${EXTRA_MOUNT:-} \
     sam3_pytorch:latest \
     bash -c "
         set -e
@@ -125,9 +147,22 @@ docker run --rm --runtime=nvidia \
 
         # Source ROS2 and workspace
         source /opt/ros/jazzy/setup.bash
-        source /ws/install/setup.bash 2>/dev/null || true
 
-        # Sync latest scripts
+        # Build packages if install/ is missing or stale
+        if [ ! -f /ws/install/isaac_ros_segment_anything3/lib/isaac_ros_segment_anything3/sam3_node.py ]; then
+            echo '[demo] Building ROS 2 packages (first run)...'
+            cd /ws && colcon build \
+                --packages-select \
+                    isaac_ros_segment_anything3_interfaces \
+                    isaac_ros_segment_anything3 \
+                --cmake-args -DCMAKE_BUILD_TYPE=Release \
+                --event-handlers console_direct+ 2>&1 | grep -E '(Starting|Finished|Failed|Error)'
+            echo '[demo] Build complete.'
+        fi
+
+        source /ws/install/setup.bash
+
+        # Sync latest scripts (dev convenience — picks up edits without rebuild)
         for _script in sam3_node.py overlay_node.py video_publisher.py; do
             cp /ws/isaac_ros_segment_anything3/scripts/\$_script \
                /ws/install/isaac_ros_segment_anything3/lib/isaac_ros_segment_anything3/\$_script 2>/dev/null || true
@@ -156,7 +191,6 @@ docker run --rm --runtime=nvidia \
             -p send_buffer_limit:=100000000 &
         FOXGLOVE_PID=\$!
 
-        # Cleanup function
         cleanup() {
             echo '[demo] Shutting down...'
             kill \$SAM3_PID \$OVERLAY_PID \$FOXGLOVE_PID \$INPUT_PID 2>/dev/null || true
@@ -164,7 +198,6 @@ docker run --rm --runtime=nvidia \
         }
         trap cleanup EXIT
 
-        # Wait for SAM3 to be ready (polls service endpoint)
         echo '[demo] Waiting for SAM3 node to be ready (~40s for torch.compile)...'
         MAX_WAIT=120
         WAITED=0
@@ -180,13 +213,11 @@ docker run --rm --runtime=nvidia \
             fi
         done
 
-        # Set initial text prompt
         echo \"[demo] Setting text prompt: '$TEXT_PROMPT'\"
         ros2 service call /sam3/set_text_prompt \
             isaac_ros_segment_anything3_interfaces/srv/SetTextPrompt \
-            \"{text_prompts: ['$TEXT_PROMPT']}\" || true
+            \"{text_prompts: ['$TEXT_PROMPT']}\" 2>/dev/null || true
 
-        # Start input source (use Docker-internal path)
         if [ '$INPUT_TYPE' = 'video' ]; then
             echo \"[demo] Starting video publisher: $DOCKER_INPUT_PATH\"
             ros2 run isaac_ros_segment_anything3 video_publisher.py \
@@ -207,6 +238,5 @@ docker run --rm --runtime=nvidia \
         echo '[demo] Press Ctrl+C to stop.'
         echo ''
 
-        # Wait for any process to exit
         wait \$SAM3_PID
     "
