@@ -13,3 +13,26 @@ test_results/
 
 # Model checkpoints (large binary files)
 models/
+
+# ROS 2 build artifacts
+build/
+install/
+log/
+
+# Datasets (large files)
+datasets/
+
+# Python virtual environment
+.venv/
+
+# NGC CLI
+ngc-cli/
+ngc-cli.md5
+ngccli_linux.zip
+
+# Temporary output files
+result.jpg
+*.output
+
+# Claude Code session data
+.claude/
